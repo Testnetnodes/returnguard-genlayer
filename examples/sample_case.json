@@ -1,0 +1,8 @@
+{
+  "case_id": "RG-4821",
+  "category": "electronics",
+  "policy": "Returns are accepted within 14 days when the product is unused and the original packaging is undamaged. Opened or visibly used products are not eligible unless defective.",
+  "customer_claim": "I tested the monitor for one evening, but the colors looked warmer than expected. The item works and all accessories are included. I want a full refund.",
+  "merchant_response": "The retail box arrived torn, the protective seal was removed, and the stand shows handling marks. The device activation log shows six hours of use.",
+  "evidence_summary": "Courier record: parcel delivered without reported damage. Merchant photos: torn box corner, removed seal, fingerprints on stand. Customer confirms the monitor was tested."
+}

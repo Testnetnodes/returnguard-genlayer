@@ -1,0 +1,958 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowRight,
+  BrainCircuit,
+  Check,
+  Circle,
+  CircleAlert,
+  ExternalLink,
+  FileCheck2,
+  FileText,
+  LoaderCircle,
+  LockKeyhole,
+  Network,
+  Scale,
+  Send,
+  ShieldCheck,
+  Sparkles,
+  Wallet,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Toaster } from "@/components/ui/sonner";
+import { Textarea } from "@/components/ui/textarea";
+
+type ReviewState = "idle" | "recording" | "submitted" | "deliberating" | "resolved";
+type PendingAction = "wallet" | "submit" | "consensus" | "check" | null;
+
+type EthereumProvider = {
+  request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
+  on?: (event: string, listener: (payload: unknown) => void) => void;
+  removeListener?: (event: string, listener: (payload: unknown) => void) => void;
+  isMetaMask?: boolean;
+  isBraveWallet?: boolean;
+  isRabby?: boolean;
+  providers?: EthereumProvider[];
+};
+
+type EIP6963ProviderDetail = {
+  info: { uuid: string; name: string; rdns: string };
+  provider: EthereumProvider;
+};
+
+type Decision = {
+  decision: "REFUND_APPROVED" | "REFUND_REJECTED" | "MANUAL_REVIEW";
+  rationale: string;
+  key_fact: string;
+};
+
+const stages = [
+  { id: "recording", label: "Case recorded", detail: "Evidence committed to the Intelligent Contract" },
+  { id: "submitted", label: "Ready for judgment", detail: "Case is waiting for validator review" },
+  { id: "deliberating", label: "Validators deliberating", detail: "Independent AI review in progress" },
+  { id: "resolved", label: "Decision finalized", detail: "Consensus committed onchain" },
+] as const;
+
+const progressByState: Record<ReviewState, number> = {
+  idle: 0,
+  recording: 18,
+  submitted: 42,
+  deliberating: 76,
+  resolved: 100,
+};
+
+const contractAddress = "0x247236463bA0eb9D7428c54780226B2772c43c8B";
+const deploymentTx = "0xc798ae97738c637371e4764144e33c6b0dd239dd1b2e8dc0c8dec99aa6ecff19";
+const decisionTx = "0x16c99579769b603e787bdceda3fe66b936ad95759aa0b29427220fbb220f8a75";
+const explorerBase = "https://explorer-studio.genlayer.com/tx";
+const siteUrl = "https://returnguard-genlayer.mustafaiciren.chatgpt.site";
+const studionetChainId = "0xf22f";
+const studionetParams = {
+  chainId: studionetChainId,
+  chainName: "GenLayer Studio Network",
+  nativeCurrency: { name: "GEN Token", symbol: "GEN", decimals: 18 },
+  rpcUrls: ["https://studio.genlayer.com/api"],
+  blockExplorerUrls: ["https://explorer-studio.genlayer.com"],
+};
+
+const announcedProviders = new Map<string, EIP6963ProviderDetail>();
+let providerDiscoveryStarted = false;
+
+async function loadGenLayer() {
+  const [sdk, chains, types] = await Promise.all([
+    import("genlayer-js"),
+    import("genlayer-js/chains"),
+    import("genlayer-js/types"),
+  ]);
+  return { ...sdk, ...chains, ...types };
+}
+
+function requestProviderAnnouncements() {
+  if (typeof window === "undefined") return;
+
+  if (!providerDiscoveryStarted) {
+    window.addEventListener("eip6963:announceProvider", ((event: CustomEvent<EIP6963ProviderDetail>) => {
+      const detail = event.detail;
+      if (!detail?.info?.uuid || typeof detail.provider?.request !== "function") return;
+      announcedProviders.set(detail.info.uuid, detail);
+    }) as EventListener);
+    providerDiscoveryStarted = true;
+  }
+
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+}
+
+async function getEthereumProvider() {
+  if (typeof window === "undefined") return undefined;
+  requestProviderAnnouncements();
+  await new Promise((resolve) => window.setTimeout(resolve, 180));
+
+  const announced = Array.from(announcedProviders.values());
+  const metamask = announced.find(({ info }) => {
+    const rdns = info.rdns.toLowerCase();
+    const name = info.name.toLowerCase();
+    return rdns === "io.metamask" || name === "metamask";
+  });
+  if (metamask) return metamask.provider;
+
+  const ethereum = (window as Window & { ethereum?: EthereumProvider }).ethereum;
+  if (!ethereum) return undefined;
+
+  const providers = ethereum.providers ?? [];
+  return (
+    providers.find((provider) => provider.isMetaMask && !provider.isBraveWallet && !provider.isRabby) ??
+    providers.find((provider) => provider.isMetaMask) ??
+    ethereum
+  );
+}
+
+function walletErrorCode(error: unknown) {
+  if (typeof error === "object" && error && "code" in error) {
+    return Number((error as { code: unknown }).code);
+  }
+  if (typeof error === "object" && error) {
+    const details = error as Record<string, unknown>;
+    for (const key of ["error", "data", "cause"]) {
+      const nestedCode = walletErrorCode(details[key]);
+      if (nestedCode !== undefined) return nestedCode;
+    }
+  }
+  return undefined;
+}
+
+async function ensureStudionet(provider: EthereumProvider) {
+  const currentChainId = await provider.request({ method: "eth_chainId" });
+  if (String(currentChainId).toLowerCase() === studionetChainId) return;
+
+  try {
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: studionetChainId }],
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message.toLowerCase() : "";
+    if (walletErrorCode(error) !== 4902 && !message.includes("unrecognized") && !message.includes("not added")) {
+      throw error;
+    }
+    await provider.request({
+      method: "wallet_addEthereumChain",
+      params: [studionetParams],
+    });
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: studionetChainId }],
+    });
+  }
+}
+
+function shortAddress(address: string) {
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function walletErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string") return error;
+  if (!error || typeof error !== "object") return "";
+
+  const details = error as Record<string, unknown>;
+  for (const key of ["message", "shortMessage", "reason", "details"]) {
+    if (typeof details[key] === "string" && details[key].trim()) return details[key];
+  }
+  for (const key of ["error", "data", "cause"]) {
+    const nested = walletErrorMessage(details[key]);
+    if (nested) return nested;
+  }
+  return "";
+}
+
+function readableWalletError(error: unknown) {
+  const message = walletErrorMessage(error);
+  const normalized = message.toLowerCase();
+  if (walletErrorCode(error) === 4001 || normalized.includes("user rejected") || message.includes("4001")) {
+    return "The wallet request was cancelled.";
+  }
+  if (normalized.includes("metamask is not installed")) {
+    return "No compatible wallet was found. Open the site in a browser tab where MetaMask is enabled.";
+  }
+  if (normalized.includes("chain") || normalized.includes("network")) {
+    return "Studionet could not be added to the wallet. Approve the network request and try again.";
+  }
+  return !message || message.length > 140 ? "The wallet could not complete this request. Please try again." : message;
+}
+
+function parseDecision(value: unknown): Decision | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<Decision>;
+    if (
+      !parsed.decision ||
+      !["REFUND_APPROVED", "REFUND_REJECTED", "MANUAL_REVIEW"].includes(parsed.decision) ||
+      typeof parsed.rationale !== "string" ||
+      typeof parsed.key_fact !== "string"
+    ) {
+      return null;
+    }
+    return parsed as Decision;
+  } catch {
+    return null;
+  }
+}
+
+function decisionTitle(decision: Decision["decision"]) {
+  if (decision === "REFUND_APPROVED") return "Refund approved";
+  if (decision === "MANUAL_REVIEW") return "Manual review";
+  return "Refund rejected";
+}
+
+export default function Home() {
+  const walletProviderRef = useRef<EthereumProvider | null>(null);
+  const [reviewState, setReviewState] = useState<ReviewState>("idle");
+  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [caseTxHash, setCaseTxHash] = useState<string | null>(null);
+  const [decisionTxHash, setDecisionTxHash] = useState<string | null>(null);
+  const [decision, setDecision] = useState<Decision | null>(null);
+  const [walletNotice, setWalletNotice] = useState<string | null>(null);
+  const [orderId, setOrderId] = useState("RG-4821");
+  const [category, setCategory] = useState("electronics");
+  const [policy, setPolicy] = useState(
+    "Returns are accepted within 14 days when the product is unused and the original packaging is undamaged. Opened or visibly used products are not eligible unless defective."
+  );
+  const [customerClaim, setCustomerClaim] = useState(
+    "I tested the monitor for one evening, but the colors looked warmer than expected. The item works and all accessories are included. I want a full refund."
+  );
+  const [merchantResponse, setMerchantResponse] = useState(
+    "The retail box arrived torn, the protective seal was removed, and the stand shows handling marks. The device activation log shows six hours of use."
+  );
+  const [evidence, setEvidence] = useState(
+    "Courier record: parcel delivered without reported damage. Merchant photos: torn box corner, removed seal, fingerprints on stand. Customer confirms the monitor was tested."
+  );
+
+  useEffect(() => {
+    const handleAccounts = (payload: unknown) => {
+      const accounts = Array.isArray(payload) ? (payload as string[]) : [];
+      const address = accounts[0] ?? null;
+      setWalletAddress(address);
+      if (address) setWalletNotice(null);
+    };
+
+    const handleChain = (payload: unknown) => {
+      if (String(payload).toLowerCase() === studionetChainId) setWalletNotice(null);
+    };
+
+    let provider: EthereumProvider | undefined;
+    let disposed = false;
+
+    getEthereumProvider().then((selectedProvider) => {
+      if (!selectedProvider || disposed) return;
+      provider = selectedProvider;
+      walletProviderRef.current = selectedProvider;
+      selectedProvider.request({ method: "eth_accounts" }).then(handleAccounts).catch(() => undefined);
+      selectedProvider.on?.("accountsChanged", handleAccounts);
+      selectedProvider.on?.("chainChanged", handleChain);
+    });
+
+    return () => {
+      disposed = true;
+      provider?.removeListener?.("accountsChanged", handleAccounts);
+      provider?.removeListener?.("chainChanged", handleChain);
+    };
+  }, []);
+
+  const createWalletClient = async (address: string) => {
+    const provider = walletProviderRef.current ?? (await getEthereumProvider());
+    if (!provider) throw new Error("MetaMask is not installed.");
+    walletProviderRef.current = provider;
+    await ensureStudionet(provider);
+    const { createClient, studionet } = await loadGenLayer();
+    return createClient({
+      chain: studionet,
+      account: address as `0x${string}`,
+      provider: provider as never,
+    });
+  };
+
+  const connectWallet = async () => {
+    const provider = await getEthereumProvider();
+    if (!provider) {
+      const message = "Wallet extension not detected. Open ReturnGuard in a regular browser tab and enable MetaMask.";
+      setWalletNotice(message);
+      toast.error(message);
+      return null;
+    }
+
+    setPendingAction("wallet");
+    try {
+      walletProviderRef.current = provider;
+      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+      const address = accounts[0];
+      if (!address) throw new Error("No wallet account was selected.");
+
+      setWalletAddress(address);
+      await ensureStudionet(provider);
+      setWalletNotice(null);
+      toast.success("Wallet connected to GenLayer Studionet.");
+      return address;
+    } catch (error) {
+      const message = readableWalletError(error);
+      setWalletNotice(message);
+      toast.error(message);
+      return null;
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const validateCase = () => {
+    if (!policy.trim() || !customerClaim.trim() || !merchantResponse.trim()) {
+      toast.error("Add the policy and both sides of the dispute first.");
+      return false;
+    }
+    if (!orderId.trim()) {
+      toast.error("Add an order reference first.");
+      return false;
+    }
+    return true;
+  };
+
+  const caseExistsOnchain = async () => {
+    const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
+    const readClient = createClient({ chain: studionet });
+    const exists = await readClient.readContract({
+      address: contractAddress,
+      functionName: "case_exists",
+      args: [orderId.trim()],
+      transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
+    });
+    return exists === true;
+  };
+
+  const checkCaseStatus = async () => {
+    setPendingAction("check");
+    try {
+      if (await caseExistsOnchain()) {
+        setReviewState("submitted");
+        toast.success("Case is recorded onchain. It is ready for AI consensus.");
+      } else {
+        toast.info("The case transaction is still being processed.");
+      }
+    } catch (error) {
+      toast.error(readableWalletError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const submitCase = async () => {
+    if (!validateCase()) return;
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+
+    setPendingAction("submit");
+    setReviewState("recording");
+    setDecision(null);
+    setDecisionTxHash(null);
+
+    let txHash: `0x${string}` | undefined;
+    try {
+      const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
+      const readClient = createClient({ chain: studionet });
+      const client = await createWalletClient(walletAddress);
+      txHash = await client.writeContract({
+        address: contractAddress,
+        functionName: "submit_case",
+        args: [
+          orderId.trim(),
+          category,
+          policy.trim(),
+          customerClaim.trim(),
+          merchantResponse.trim(),
+          evidence.trim(),
+        ],
+        value: 0n,
+        leaderOnly: true,
+      });
+      setCaseTxHash(txHash);
+
+      const receipt = await readClient.waitForTransactionReceipt({
+        hash: txHash,
+        status: TransactionStatus.ACCEPTED,
+        interval: 2_000,
+        retries: 90,
+      });
+      if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        throw new Error("The contract rejected the case transaction.");
+      }
+
+      setReviewState("submitted");
+      toast.success("Case recorded onchain. Now start AI consensus.");
+    } catch (error) {
+      if (txHash) {
+        setReviewState("recording");
+        toast.error("The transaction was submitted but is still processing. Check its status before trying again.");
+      } else {
+        setReviewState("idle");
+        toast.error(readableWalletError(error));
+      }
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const readDecision = async () => {
+    const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
+    const readClient = createClient({ chain: studionet });
+    const result = await readClient.readContract({
+      address: contractAddress,
+      functionName: "get_decision",
+      args: [orderId.trim()],
+      transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
+    });
+    return parseDecision(result);
+  };
+
+  const checkDecision = async () => {
+    setPendingAction("check");
+    try {
+      const currentDecision = await readDecision();
+      if (!currentDecision) {
+        toast.info("Validators are still reviewing this case.");
+        return;
+      }
+      setDecision(currentDecision);
+      setReviewState("resolved");
+      toast.success("AI consensus decision is ready.");
+    } catch (error) {
+      toast.error(readableWalletError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const runConsensus = async () => {
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+
+    setPendingAction("consensus");
+    setReviewState("deliberating");
+
+    let txHash: `0x${string}` | undefined;
+    try {
+      const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
+      const readClient = createClient({ chain: studionet });
+      const client = await createWalletClient(walletAddress);
+      txHash = await client.writeContract({
+        address: contractAddress,
+        functionName: "adjudicate",
+        args: [orderId.trim()],
+        value: 0n,
+      });
+      setDecisionTxHash(txHash);
+
+      const receipt = await readClient.waitForTransactionReceipt({
+        hash: txHash,
+        status: TransactionStatus.ACCEPTED,
+        interval: 3_000,
+        retries: 120,
+      });
+      if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        throw new Error("The validators could not complete this decision.");
+      }
+
+      const currentDecision = await readDecision();
+      if (!currentDecision) throw new Error("The decision is finalizing. Check again in a moment.");
+      setDecision(currentDecision);
+      setReviewState("resolved");
+      toast.success("AI consensus finalized onchain.");
+    } catch (error) {
+      if (txHash) {
+        setReviewState("deliberating");
+        toast.error("Consensus was submitted and may still be running. Use Check decision instead of resubmitting.");
+      } else {
+        setReviewState("submitted");
+        toast.error(readableWalletError(error));
+      }
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handlePrimaryAction = async () => {
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+    if (reviewState === "recording") {
+      await checkCaseStatus();
+      return;
+    }
+    if (reviewState === "submitted") {
+      await runConsensus();
+      return;
+    }
+    if (reviewState === "deliberating") {
+      await checkDecision();
+      return;
+    }
+    await submitCase();
+  };
+
+  const primaryLabel = () => {
+    if (pendingAction === "wallet") return "Connecting wallet";
+    if (pendingAction === "submit") return "Recording case";
+    if (pendingAction === "consensus") return "Starting consensus";
+    if (pendingAction === "check") return "Checking chain";
+    if (!walletAddress) return "Connect wallet";
+    if (reviewState === "recording") return "Check case status";
+    if (reviewState === "submitted") return "Run AI consensus";
+    if (reviewState === "deliberating") return "Check decision";
+    return "Submit case onchain";
+  };
+
+  const activeStage = stages.findIndex((stage) => stage.id === reviewState);
+  const formLocked = reviewState === "recording" || reviewState === "submitted" || reviewState === "deliberating";
+
+  return (
+    <main className="min-h-screen overflow-hidden bg-[#07100d] text-[#eef7f2]">
+      <Toaster position="top-right" richColors />
+
+      <div className="docket-grid fixed inset-0 pointer-events-none opacity-50" />
+      <div className="glow-orb fixed -right-44 -top-44 h-[34rem] w-[34rem] rounded-full bg-[#b6ff4a]/10 blur-[120px]" />
+
+      <header className="relative z-10 border-b border-white/10 bg-[#07100d]/80 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-[1480px] items-center justify-between px-5 py-4 sm:px-8">
+          <div className="flex items-center gap-3">
+            <div className="brand-mark flex size-10 items-center justify-center rounded-xl border border-[#b6ff4a]/35 bg-[#b6ff4a]/10">
+              <ShieldCheck className="size-5 text-[#b6ff4a]" strokeWidth={2.2} />
+            </div>
+            <div>
+              <p className="text-[1.05rem] font-semibold tracking-[-0.02em]">ReturnGuard</p>
+              <p className="text-xs text-[#8da198]">Autonomous dispute resolution</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Badge className="hidden border-[#b6ff4a]/20 bg-[#b6ff4a]/10 text-[#caff80] sm:inline-flex">
+              <Sparkles className="size-3" /> Built on GenLayer
+            </Badge>
+            <Badge variant="outline" className="border-[#b6ff4a]/30 bg-[#b6ff4a]/5 text-[#b6ff4a]">
+              <span className="size-1.5 rounded-full bg-[#b6ff4a] shadow-[0_0_10px_#b6ff4a]" />
+              Studionet live
+            </Badge>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={pendingAction === "wallet"}
+              onClick={connectWallet}
+              className="h-9 rounded-lg border-white/15 bg-white/[0.035] px-3 text-[#d9e6df] hover:border-[#b6ff4a]/35 hover:bg-[#b6ff4a]/8 hover:text-white"
+            >
+              {pendingAction === "wallet" ? <LoaderCircle className="size-4 animate-spin" /> : <Wallet className="size-4 text-[#b6ff4a]" />}
+              <span className="hidden sm:inline">{walletAddress ? shortAddress(walletAddress) : "Connect wallet"}</span>
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <div className="relative z-10 mx-auto max-w-[1480px] px-5 py-7 sm:px-8 lg:py-10">
+        <section className="mb-7 flex flex-col justify-between gap-4 md:flex-row md:items-end">
+          <div>
+            <div className="mb-3 flex items-center gap-2 text-sm text-[#b6ff4a]">
+              <span className="inline-block h-px w-8 bg-[#b6ff4a]" />
+              Case adjudication workspace
+            </div>
+            <h1 className="max-w-3xl text-3xl font-semibold tracking-[-0.04em] text-white sm:text-4xl lg:text-[2.85rem] lg:leading-[1.05]">
+              Turn return disputes into verifiable decisions.
+            </h1>
+          </div>
+          <p className="max-w-md text-[15px] leading-6 text-[#94a79e]">
+            Submit the policy and evidence. Independent validators review the same case, agree on an outcome, and record the reasoning.
+          </p>
+        </section>
+
+        <section className="mb-5 flex flex-col gap-4 rounded-2xl border border-[#b6ff4a]/15 bg-[#0b1713]/80 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[#b6ff4a]/10 text-[#b6ff4a]">
+              <ShieldCheck className="size-[18px]" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-white">Intelligent Contract deployed and verified</p>
+              <p className="mt-1 truncate font-mono text-xs text-[#7f9389]">{contractAddress}</p>
+            </div>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <a
+              href={`${explorerBase}/${deploymentTx}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-white/10 px-3 text-xs font-medium text-[#a9bbb1] transition-colors hover:border-white/20 hover:text-white"
+            >
+              Deployment <ExternalLink className="size-3.5" />
+            </a>
+            <a
+              href={`${explorerBase}/${decisionTx}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-[#b6ff4a]/20 bg-[#b6ff4a]/5 px-3 text-xs font-medium text-[#caff80] transition-colors hover:bg-[#b6ff4a]/10"
+            >
+              Consensus proof <ExternalLink className="size-3.5" />
+            </a>
+          </div>
+        </section>
+
+        {walletNotice && (
+          <section
+            role="alert"
+            aria-live="polite"
+            className="mb-5 flex flex-col gap-3 rounded-2xl border border-[#ffb367]/25 bg-[#ff9b3f]/8 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5"
+          >
+            <div className="flex items-start gap-3">
+              <CircleAlert className="mt-0.5 size-[18px] shrink-0 text-[#ffb367]" />
+              <div>
+                <p className="text-sm font-medium text-white">Wallet connection needs attention</p>
+                <p className="mt-1 text-sm leading-5 text-[#c7b7a6]">{walletNotice}</p>
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-2 pl-[30px] sm:pl-0">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={connectWallet}
+                disabled={pendingAction === "wallet"}
+                className="border-[#ffb367]/25 bg-transparent text-[#ffd1a5] hover:bg-[#ff9b3f]/10 hover:text-white"
+              >
+                Try again
+              </Button>
+              <a
+                href={siteUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-white/10 px-3 text-xs font-medium text-[#d7e3dc] transition-colors hover:border-white/20 hover:text-white"
+              >
+                Open in new tab <ExternalLink className="size-3.5" />
+              </a>
+            </div>
+          </section>
+        )}
+
+        <div className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]">
+          <section className="panel-shell rounded-[1.4rem] border border-white/10 bg-[#0b1713]/90 p-4 shadow-2xl shadow-black/20 sm:p-6">
+            <div className="mb-6 flex items-start justify-between gap-4 border-b border-white/8 pb-5">
+              <div className="flex items-center gap-3">
+                <div className="flex size-9 items-center justify-center rounded-lg bg-white/5 text-[#c1d0c8]">
+                  <FileText className="size-[18px]" />
+                </div>
+                <div>
+                  <h2 className="font-medium text-white">New dispute</h2>
+                  <p className="mt-0.5 text-sm text-[#7f9389]">Both sides are visible to the validator set.</p>
+                </div>
+              </div>
+              <Badge variant="outline" className="border-white/10 font-mono text-[#7f9389]">
+                CASE / {orderId || "NEW"}
+              </Badge>
+            </div>
+
+            <div className="grid gap-5">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Order reference" htmlFor="order-id">
+                  <Input
+                    id="order-id"
+                    value={orderId}
+                    onChange={(event) => setOrderId(event.target.value)}
+                    disabled={formLocked}
+                    className="h-11 border-white/10 bg-black/15 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-[#cad8d0]" htmlFor="category">
+                    Product category
+                  </label>
+                  <Select value={category} onValueChange={setCategory}>
+                    <SelectTrigger disabled={formLocked} id="category" className="h-11 w-full border-white/10 bg-black/15 text-white focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="border-white/10 bg-[#102019] text-white">
+                      <SelectItem value="electronics">Electronics</SelectItem>
+                      <SelectItem value="beauty">Beauty & personal care</SelectItem>
+                      <SelectItem value="fashion">Fashion</SelectItem>
+                      <SelectItem value="home">Home & living</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <Field label="Return policy" htmlFor="policy" hint="The rulebook validators must apply">
+                <Textarea
+                  id="policy"
+                  value={policy}
+                  onChange={(event) => setPolicy(event.target.value)}
+                  disabled={formLocked}
+                  className="min-h-24 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                />
+              </Field>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Field label="Customer claim" htmlFor="customer-claim">
+                  <Textarea
+                    id="customer-claim"
+                    value={customerClaim}
+                    onChange={(event) => setCustomerClaim(event.target.value)}
+                    disabled={formLocked}
+                    className="min-h-32 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
+                <Field label="Merchant response" htmlFor="merchant-response">
+                  <Textarea
+                    id="merchant-response"
+                    value={merchantResponse}
+                    onChange={(event) => setMerchantResponse(event.target.value)}
+                    disabled={formLocked}
+                    className="min-h-32 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
+              </div>
+
+              <Field label="Evidence summary" htmlFor="evidence" hint="Links, photos, tracking records, or device logs">
+                <Textarea
+                  id="evidence"
+                  value={evidence}
+                  onChange={(event) => setEvidence(event.target.value)}
+                  disabled={formLocked}
+                  className="min-h-24 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                />
+              </Field>
+
+              <div className="flex flex-col gap-3 border-t border-white/8 pt-5 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-2 text-sm text-[#81958a]">
+                  <LockKeyhole className="size-4 text-[#b6ff4a]" />
+                  Decision fields require validator agreement.
+                </div>
+                <Button
+                  type="button"
+                  size="lg"
+                  disabled={pendingAction !== null}
+                  onClick={handlePrimaryAction}
+                  className="h-11 rounded-xl bg-[#b6ff4a] px-5 font-semibold text-[#0a120f] shadow-[0_0_30px_rgba(182,255,74,0.13)] hover:bg-[#c8ff78]"
+                >
+                  {pendingAction ? <LoaderCircle className="size-4 animate-spin" /> : reviewState === "submitted" ? <BrainCircuit className="size-4" /> : reviewState === "deliberating" ? <Circle className="size-4" /> : <Send className="size-4" />}
+                  {primaryLabel()}
+                  {!pendingAction && reviewState !== "deliberating" && <ArrowRight className="size-4" />}
+                </Button>
+              </div>
+
+              {(caseTxHash || decisionTxHash) && (
+                <div className="grid gap-2 rounded-xl border border-white/8 bg-black/15 p-3 text-xs sm:grid-cols-2">
+                  {caseTxHash && (
+                    <TransactionLink label="Case transaction" hash={caseTxHash} />
+                  )}
+                  {decisionTxHash && (
+                    <TransactionLink label="Consensus transaction" hash={decisionTxHash} />
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <aside className="space-y-5">
+            <section className="panel-shell rounded-[1.4rem] border border-white/10 bg-[#0b1713]/90 p-5 shadow-2xl shadow-black/20 sm:p-6">
+              <div className="mb-6 flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="flex size-9 items-center justify-center rounded-lg bg-[#b6ff4a]/10 text-[#b6ff4a]">
+                    <Network className="size-[18px]" />
+                  </div>
+                  <div>
+                    <h2 className="font-medium text-white">Consensus docket</h2>
+                    <p className="mt-0.5 text-sm text-[#7f9389]">Five independent GenLayer validators</p>
+                  </div>
+                </div>
+                <span className={`status-pulse ${reviewState === "idle" ? "is-idle" : ""}`} aria-hidden="true" />
+              </div>
+
+              <Progress value={progressByState[reviewState]} className="mb-6 h-1.5 bg-white/8 [&_[data-slot=progress-indicator]]:bg-[#b6ff4a]" />
+
+              <div className="space-y-1">
+                {stages.map((stage, index) => {
+                  const isComplete = reviewState === "resolved" || index < activeStage;
+                  const isActive = index === activeStage && reviewState !== "idle";
+
+                  return (
+                    <div key={stage.id} className={`stage-row ${isActive ? "is-active" : ""}`}>
+                      <div className="relative flex w-8 shrink-0 justify-center">
+                        {index < stages.length - 1 && <span className="absolute left-1/2 top-6 h-10 w-px -translate-x-1/2 bg-white/10" />}
+                        <div className={`stage-icon ${isComplete ? "is-complete" : isActive ? "is-active" : ""}`}>
+                          {isComplete ? <Check className="size-3.5" /> : <Circle className="size-3" />}
+                        </div>
+                      </div>
+                      <div className="pb-6">
+                        <p className={`text-sm font-medium ${isActive || isComplete ? "text-white" : "text-[#6f8178]"}`}>{stage.label}</p>
+                        <p className="mt-1 text-xs text-[#6f8178]">{stage.detail}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section className={`decision-card rounded-[1.4rem] border p-5 sm:p-6 ${reviewState === "resolved" ? "is-resolved" : ""}`}>
+              {reviewState === "resolved" && decision ? (
+                <div className="animate-in fade-in slide-in-from-bottom-2 duration-500">
+                  <div className="mb-5 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb367]">Final decision</p>
+                      <h2 className="text-2xl font-semibold tracking-[-0.03em] text-white">{decisionTitle(decision.decision)}</h2>
+                    </div>
+                    <div className="consensus-seal flex size-14 items-center justify-center rounded-full border border-[#ff9b3f]/40 bg-[#ff9b3f]/10">
+                      <Scale className="size-6 text-[#ffad5f]" />
+                    </div>
+                  </div>
+
+                  <p className="border-l-2 border-[#ff9b3f]/70 pl-4 text-[15px] leading-6 text-[#c8d5ce]">
+                    {decision.rationale}
+                  </p>
+
+                  <p className="mt-4 rounded-lg border border-white/8 bg-black/15 px-3 py-2.5 text-xs text-[#90a299]">
+                    Key fact: <span className="font-medium text-[#d7e3dc]">{decision.key_fact}</span>
+                  </p>
+
+                  <div className="mt-6 grid grid-cols-3 divide-x divide-white/10 rounded-xl border border-white/10 bg-black/15 py-4 text-center">
+                    <Metric value="3 / 5" label="Quorum" />
+                    <Metric value="Full AI" label="Consensus" />
+                    <Metric value="Finalized" label="Onchain" />
+                  </div>
+
+                  <a
+                    href={`${explorerBase}/${decisionTxHash ?? decisionTx}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-5 flex items-center gap-2 text-xs text-[#9cb0a5] transition-colors hover:text-[#b6ff4a]"
+                  >
+                    <FileCheck2 className="size-4 text-[#b6ff4a]" />
+                    View the finalized validator decision
+                    <ExternalLink className="ml-auto size-3.5" />
+                  </a>
+                </div>
+              ) : (
+                <div className="flex min-h-[15.5rem] flex-col items-center justify-center px-5 text-center">
+                  <div className="mb-4 flex size-14 items-center justify-center rounded-2xl border border-dashed border-white/15 bg-white/[0.025]">
+                    <Scale className="size-6 text-[#53665d]" />
+                  </div>
+                  <h2 className="font-medium text-[#c6d4cc]">No decision yet</h2>
+                  <p className="mt-2 max-w-sm text-sm leading-6 text-[#71847a]">
+                    {reviewState === "submitted"
+                      ? "The case is onchain. Start AI consensus to ask the validator set for a decision."
+                      : reviewState === "deliberating"
+                        ? "The transaction is live. Validators are independently reviewing the policy and evidence."
+                        : reviewState === "recording"
+                          ? "Your signed case transaction is being recorded on GenLayer."
+                          : "Connect your wallet and submit the case to begin an onchain review."}
+                  </p>
+                </div>
+              )}
+            </section>
+
+            <div className="grid grid-cols-2 gap-3">
+              <ProtocolCard icon={<Scale className="size-4" />} title="Policy-bound" copy="Judgment follows merchant rules." />
+              <ProtocolCard icon={<ShieldCheck className="size-4" />} title="Auditable" copy="Decision and rationale stay verifiable." />
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function Field({
+  label,
+  htmlFor,
+  hint,
+  children,
+}: {
+  label: string;
+  htmlFor: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-sm font-medium text-[#cad8d0]" htmlFor={htmlFor}>
+          {label}
+        </label>
+        {hint && <span className="hidden text-xs text-[#63766c] sm:block">{hint}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Metric({ value, label }: { value: string; label: string }) {
+  return (
+    <div className="px-2">
+      <p className="text-base font-semibold text-white sm:text-lg">{value}</p>
+      <p className="mt-1 text-[11px] uppercase tracking-[0.12em] text-[#72857b]">{label}</p>
+    </div>
+  );
+}
+
+function ProtocolCard({ icon, title, copy }: { icon: React.ReactNode; title: string; copy: string }) {
+  return (
+    <div className="rounded-2xl border border-white/8 bg-[#0a1511]/80 p-4">
+      <div className="mb-3 flex size-8 items-center justify-center rounded-lg bg-white/5 text-[#9fb2a8]">{icon}</div>
+      <p className="text-sm font-medium text-[#d6e2dc]">{title}</p>
+      <p className="mt-1 text-xs leading-5 text-[#687b71]">{copy}</p>
+    </div>
+  );
+}
+
+function TransactionLink({ label, hash }: { label: string; hash: string }) {
+  return (
+    <a
+      href={`${explorerBase}/${hash}`}
+      target="_blank"
+      rel="noreferrer"
+      className="flex min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-[#91a59a] transition-colors hover:bg-white/5 hover:text-[#b6ff4a]"
+    >
+      <FileCheck2 className="size-3.5 shrink-0 text-[#b6ff4a]" />
+      <span className="truncate">{label}</span>
+      <ExternalLink className="ml-auto size-3.5 shrink-0" />
+    </a>
+  );
+}
