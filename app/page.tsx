@@ -35,8 +35,15 @@ import {
 import { Toaster } from "@/components/ui/sonner";
 import { Textarea } from "@/components/ui/textarea";
 
-type ReviewState = "idle" | "recording" | "submitted" | "deliberating" | "resolved";
-type PendingAction = "wallet" | "submit" | "consensus" | "check" | null;
+type ReviewState =
+  | "idle"
+  | "publishing-policy"
+  | "policy-ready"
+  | "recording"
+  | "submitted"
+  | "deliberating"
+  | "resolved";
+type PendingAction = "wallet" | "policy" | "submit" | "consensus" | "check" | null;
 
 type EthereumProvider = {
   request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
@@ -60,22 +67,26 @@ type Decision = {
 };
 
 const stages = [
-  { id: "recording", label: "Case recorded", detail: "Evidence committed to the Intelligent Contract" },
-  { id: "submitted", label: "Ready for judgment", detail: "Case is waiting for validator review" },
+  { id: "policy", label: "Policy precommitted", detail: "Immutable policy hash published before the case" },
+  { id: "case", label: "Case recorded", detail: "Evidence linked to the published policy hash" },
   { id: "deliberating", label: "Validators deliberating", detail: "Independent AI review in progress" },
   { id: "resolved", label: "Decision finalized", detail: "Consensus committed onchain" },
 ] as const;
 
 const progressByState: Record<ReviewState, number> = {
   idle: 0,
-  recording: 18,
-  submitted: 42,
-  deliberating: 76,
+  "publishing-policy": 12,
+  "policy-ready": 25,
+  recording: 38,
+  submitted: 50,
+  deliberating: 75,
   resolved: 100,
 };
 
-const contractAddress = "0x23053f5bac38464Bffcf857b8A8bDeB5aa0dca28";
-const deploymentTx = "0xcf2e45229737cf1d290a98736af37bdbca5f3504a8ea6efaabb6a6c61faeb30d";
+const contractAddress = "0x0dEe3259d5c17eE009080a4aA2e951D6b4a98220";
+const deploymentTx = "0x8507e55dfeca0027da7b370276bbfa6a625a1173bdd13af68d4d6bbf69360001";
+const samplePolicyHash = "9016999cbee63ee12c5f0fddf974bc849235ce09f425c3809f674504dd822c93";
+const samplePolicyTx = "0x404225214e3f8455b467d496c3dc1e90520607bcb59161012c508433363ab68a";
 const explorerBase = "https://explorer-studio.genlayer.com/tx";
 const contractExplorerBase = "https://explorer-studio.genlayer.com/address";
 const siteUrl = "https://returnguard-genlayer.mustafaiciren.chatgpt.site";
@@ -98,6 +109,12 @@ async function loadGenLayer() {
     import("genlayer-js/types"),
   ]);
   return { ...sdk, ...chains, ...types };
+}
+
+async function sha256Hex(value: string) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function requestProviderAnnouncements() {
@@ -242,6 +259,8 @@ export default function Home() {
   const [reviewState, setReviewState] = useState<ReviewState>("idle");
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [policyHash, setPolicyHash] = useState<string | null>(null);
+  const [policyTxHash, setPolicyTxHash] = useState<string | null>(null);
   const [caseTxHash, setCaseTxHash] = useState<string | null>(null);
   const [decisionTxHash, setDecisionTxHash] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision | null>(null);
@@ -336,9 +355,21 @@ export default function Home() {
     }
   };
 
+  const validatePolicy = () => {
+    if (!policy.trim()) {
+      toast.error("Add the return policy first.");
+      return false;
+    }
+    return true;
+  };
+
   const validateCase = () => {
-    if (!policy.trim() || !customerClaim.trim() || !merchantResponse.trim()) {
-      toast.error("Add the policy and both sides of the dispute first.");
+    if (!policyHash) {
+      toast.error("Publish the policy onchain before submitting the case.");
+      return false;
+    }
+    if (!customerClaim.trim() || !merchantResponse.trim()) {
+      toast.error("Add both sides of the dispute first.");
       return false;
     }
     if (!orderId.trim()) {
@@ -346,6 +377,101 @@ export default function Home() {
       return false;
     }
     return true;
+  };
+
+  const policyExistsOnchain = async (hash: string) => {
+    const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
+    const readClient = createClient({ chain: studionet });
+    const exists = await readClient.readContract({
+      address: contractAddress,
+      functionName: "policy_exists",
+      args: [hash],
+      transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
+    });
+    return exists === true;
+  };
+
+  const checkPolicyStatus = async () => {
+    if (!validatePolicy()) return;
+    setPendingAction("check");
+    try {
+      const hash = await sha256Hex(policy.trim());
+      if (await policyExistsOnchain(hash)) {
+        setPolicyHash(hash);
+        if (hash === samplePolicyHash) setPolicyTxHash(samplePolicyTx);
+        setReviewState("policy-ready");
+        toast.success("Policy is locked onchain. The case can now reference its hash.");
+      } else {
+        toast.info("The policy transaction is still being processed.");
+      }
+    } catch (error) {
+      toast.error(readableWalletError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const publishPolicy = async () => {
+    if (!validatePolicy()) return;
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+
+    const normalizedPolicy = policy.trim();
+    const hash = await sha256Hex(normalizedPolicy);
+    setPolicyHash(hash);
+    setPendingAction("policy");
+    setReviewState("publishing-policy");
+
+    let txHash: `0x${string}` | undefined;
+    try {
+      if (await policyExistsOnchain(hash)) {
+        if (hash === samplePolicyHash) setPolicyTxHash(samplePolicyTx);
+        setReviewState("policy-ready");
+        toast.success("This exact policy was already published onchain.");
+        return;
+      }
+
+      const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
+      const readClient = createClient({ chain: studionet });
+      const client = await createWalletClient(walletAddress);
+      txHash = await client.writeContract({
+        address: contractAddress,
+        functionName: "publish_policy",
+        args: [normalizedPolicy],
+        value: 0n,
+        leaderOnly: true,
+      });
+      setPolicyTxHash(txHash);
+
+      const receipt = await readClient.waitForTransactionReceipt({
+        hash: txHash,
+        status: TransactionStatus.ACCEPTED,
+        interval: 2_000,
+        retries: 90,
+      });
+      if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        throw new Error("The contract rejected the policy transaction.");
+      }
+      if (!(await policyExistsOnchain(hash))) {
+        throw new Error("The policy is still finalizing. Check again in a moment.");
+      }
+
+      setReviewState("policy-ready");
+      toast.success("Policy published first. The case can now reference its hash.");
+    } catch (error) {
+      if (txHash) {
+        setReviewState("publishing-policy");
+        toast.error("The policy transaction was submitted and may still be processing. Check its status before continuing.");
+      } else {
+        setPolicyHash(null);
+        setReviewState("idle");
+        toast.error(readableWalletError(error));
+      }
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   const caseExistsOnchain = async () => {
@@ -390,6 +516,10 @@ export default function Home() {
 
     let txHash: `0x${string}` | undefined;
     try {
+      const currentPolicyHash = await sha256Hex(policy.trim());
+      if (currentPolicyHash !== policyHash) {
+        throw new Error("The policy changed after publication. Publish the new version before submitting the case.");
+      }
       const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
       const readClient = createClient({ chain: studionet });
       const client = await createWalletClient(walletAddress);
@@ -399,7 +529,7 @@ export default function Home() {
         args: [
           orderId.trim(),
           category,
-          policy.trim(),
+          policyHash,
           customerClaim.trim(),
           merchantResponse.trim(),
           evidence.trim(),
@@ -519,6 +649,18 @@ export default function Home() {
       await connectWallet();
       return;
     }
+    if (reviewState === "publishing-policy") {
+      await checkPolicyStatus();
+      return;
+    }
+    if (reviewState === "idle") {
+      await publishPolicy();
+      return;
+    }
+    if (reviewState === "policy-ready") {
+      await submitCase();
+      return;
+    }
     if (reviewState === "recording") {
       await checkCaseStatus();
       return;
@@ -531,23 +673,45 @@ export default function Home() {
       await checkDecision();
       return;
     }
-    await submitCase();
   };
 
   const primaryLabel = () => {
     if (pendingAction === "wallet") return "Connecting wallet";
+    if (pendingAction === "policy") return "Publishing policy";
     if (pendingAction === "submit") return "Recording case";
     if (pendingAction === "consensus") return "Starting consensus";
     if (pendingAction === "check") return "Checking chain";
     if (!walletAddress) return "Connect wallet";
+    if (reviewState === "idle") return "Publish policy onchain";
+    if (reviewState === "publishing-policy") return "Check policy status";
+    if (reviewState === "policy-ready") return "Submit case onchain";
     if (reviewState === "recording") return "Check case status";
     if (reviewState === "submitted") return "Run AI consensus";
     if (reviewState === "deliberating") return "Check decision";
-    return "Submit case onchain";
+    return "Decision finalized";
   };
 
-  const activeStage = stages.findIndex((stage) => stage.id === reviewState);
-  const formLocked = reviewState === "recording" || reviewState === "submitted" || reviewState === "deliberating";
+  const completedStages: Record<ReviewState, number> = {
+    idle: 0,
+    "publishing-policy": 0,
+    "policy-ready": 1,
+    recording: 1,
+    submitted: 2,
+    deliberating: 2,
+    resolved: 4,
+  };
+  const activeStageByState: Record<ReviewState, number | null> = {
+    idle: null,
+    "publishing-policy": 0,
+    "policy-ready": null,
+    recording: 1,
+    submitted: null,
+    deliberating: 2,
+    resolved: null,
+  };
+  const activeStage = activeStageByState[reviewState];
+  const formLocked = ["recording", "submitted", "deliberating", "resolved"].includes(reviewState);
+  const policyLocked = reviewState === "publishing-policy" || formLocked;
 
   return (
     <main className="min-h-screen overflow-hidden bg-[#07100d] text-[#eef7f2]">
@@ -603,7 +767,7 @@ export default function Home() {
             </h1>
           </div>
           <p className="max-w-md text-[15px] leading-6 text-[#94a79e]">
-            Submit the policy and evidence. Independent validators review the same case, agree on an outcome, and record the reasoning.
+            Publish the policy first, then submit a case bound to its immutable hash. Independent validators review the evidence and record the outcome.
           </p>
         </section>
 
@@ -723,11 +887,34 @@ export default function Home() {
                 <Textarea
                   id="policy"
                   value={policy}
-                  onChange={(event) => setPolicy(event.target.value)}
-                  disabled={formLocked}
+                  onChange={(event) => {
+                    setPolicy(event.target.value);
+                    if (reviewState === "policy-ready") {
+                      setPolicyHash(null);
+                      setPolicyTxHash(null);
+                      setReviewState("idle");
+                    }
+                  }}
+                  disabled={policyLocked}
                   className="min-h-24 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
                 />
               </Field>
+
+              <div className="rounded-xl border border-[#b6ff4a]/15 bg-[#b6ff4a]/[0.035] px-3.5 py-3">
+                <div className="flex items-start gap-2.5">
+                  <LockKeyhole className="mt-0.5 size-4 shrink-0 text-[#b6ff4a]" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-[#dce9e2]">
+                      {policyHash && reviewState !== "publishing-policy" ? "Policy published before case" : "Policy must be published first"}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-[#789086]">
+                      {policyHash
+                        ? `SHA-256 ${policyHash}`
+                        : "The contract records the policy in a separate transaction. The case later references only its SHA-256 hash."}
+                    </p>
+                  </div>
+                </div>
+              </div>
 
               <div className="grid gap-4 lg:grid-cols-2">
                 <Field label="Customer claim" htmlFor="customer-claim">
@@ -763,23 +950,26 @@ export default function Home() {
               <div className="flex flex-col gap-3 border-t border-white/8 pt-5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-2 text-sm text-[#81958a]">
                   <LockKeyhole className="size-4 text-[#b6ff4a]" />
-                  Decision fields require validator agreement.
+                  Cases can only reference a policy already recorded onchain.
                 </div>
                 <Button
                   type="button"
                   size="lg"
-                  disabled={pendingAction !== null}
+                  disabled={pendingAction !== null || reviewState === "resolved"}
                   onClick={handlePrimaryAction}
                   className="h-11 rounded-xl bg-[#b6ff4a] px-5 font-semibold text-[#0a120f] shadow-[0_0_30px_rgba(182,255,74,0.13)] hover:bg-[#c8ff78]"
                 >
-                  {pendingAction ? <LoaderCircle className="size-4 animate-spin" /> : reviewState === "submitted" ? <BrainCircuit className="size-4" /> : reviewState === "deliberating" ? <Circle className="size-4" /> : <Send className="size-4" />}
+                  {pendingAction ? <LoaderCircle className="size-4 animate-spin" /> : reviewState === "submitted" ? <BrainCircuit className="size-4" /> : reviewState === "deliberating" ? <Circle className="size-4" /> : reviewState === "idle" || reviewState === "publishing-policy" ? <LockKeyhole className="size-4" /> : <Send className="size-4" />}
                   {primaryLabel()}
                   {!pendingAction && reviewState !== "deliberating" && <ArrowRight className="size-4" />}
                 </Button>
               </div>
 
-              {(caseTxHash || decisionTxHash) && (
-                <div className="grid gap-2 rounded-xl border border-white/8 bg-black/15 p-3 text-xs sm:grid-cols-2">
+              {(policyTxHash || caseTxHash || decisionTxHash) && (
+                <div className="grid gap-2 rounded-xl border border-white/8 bg-black/15 p-3 text-xs sm:grid-cols-3">
+                  {policyTxHash && (
+                    <TransactionLink label="Policy transaction" hash={policyTxHash} />
+                  )}
                   {caseTxHash && (
                     <TransactionLink label="Case transaction" hash={caseTxHash} />
                   )}
@@ -810,8 +1000,8 @@ export default function Home() {
 
               <div className="space-y-1">
                 {stages.map((stage, index) => {
-                  const isComplete = reviewState === "resolved" || index < activeStage;
-                  const isActive = index === activeStage && reviewState !== "idle";
+                  const isComplete = index < completedStages[reviewState];
+                  const isActive = index === activeStage;
 
                   return (
                     <div key={stage.id} className={`stage-row ${isActive ? "is-active" : ""}`}>
@@ -884,7 +1074,11 @@ export default function Home() {
                         ? "The transaction is live. Validators are independently reviewing the policy and evidence."
                         : reviewState === "recording"
                           ? "Your signed case transaction is being recorded on GenLayer."
-                          : "Connect your wallet and submit the case to begin an onchain review."}
+                          : reviewState === "policy-ready"
+                            ? "The policy is locked onchain. Submit the case to bind its evidence to that policy hash."
+                            : reviewState === "publishing-policy"
+                              ? "The policy commitment is being recorded before any case can reference it."
+                              : "Connect your wallet and publish the return policy before submitting a dispute."}
                   </p>
                 </div>
               )}
