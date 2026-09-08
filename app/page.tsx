@@ -74,10 +74,10 @@ const progressByState: Record<ReviewState, number> = {
   resolved: 100,
 };
 
-const contractAddress = "0x247236463bA0eb9D7428c54780226B2772c43c8B";
-const deploymentTx = "0xc798ae97738c637371e4764144e33c6b0dd239dd1b2e8dc0c8dec99aa6ecff19";
-const decisionTx = "0x16c99579769b603e787bdceda3fe66b936ad95759aa0b29427220fbb220f8a75";
+const contractAddress = "0x23053f5bac38464Bffcf857b8A8bDeB5aa0dca28";
+const deploymentTx = "0xcf2e45229737cf1d290a98736af37bdbca5f3504a8ea6efaabb6a6c61faeb30d";
 const explorerBase = "https://explorer-studio.genlayer.com/tx";
+const contractExplorerBase = "https://explorer-studio.genlayer.com/address";
 const siteUrl = "https://returnguard-genlayer.mustafaiciren.chatgpt.site";
 const studionetChainId = "0xf22f";
 const studionetParams = {
@@ -627,12 +627,12 @@ export default function Home() {
               Deployment <ExternalLink className="size-3.5" />
             </a>
             <a
-              href={`${explorerBase}/${decisionTx}`}
+              href={`${contractExplorerBase}/${contractAddress}`}
               target="_blank"
               rel="noreferrer"
               className="inline-flex h-9 items-center gap-2 rounded-lg border border-[#b6ff4a]/20 bg-[#b6ff4a]/5 px-3 text-xs font-medium text-[#caff80] transition-colors hover:bg-[#b6ff4a]/10"
             >
-              Consensus proof <ExternalLink className="size-3.5" />
+              Contract <ExternalLink className="size-3.5" />
             </a>
           </div>
         </section>
@@ -858,16 +858,18 @@ export default function Home() {
                     <Metric value="Finalized" label="Onchain" />
                   </div>
 
-                  <a
-                    href={`${explorerBase}/${decisionTxHash ?? decisionTx}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-5 flex items-center gap-2 text-xs text-[#9cb0a5] transition-colors hover:text-[#b6ff4a]"
-                  >
-                    <FileCheck2 className="size-4 text-[#b6ff4a]" />
-                    View the finalized validator decision
-                    <ExternalLink className="ml-auto size-3.5" />
-                  </a>
+                  {decisionTxHash && (
+                    <a
+                      href={`${explorerBase}/${decisionTxHash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-5 flex items-center gap-2 text-xs text-[#9cb0a5] transition-colors hover:text-[#b6ff4a]"
+                    >
+                      <FileCheck2 className="size-4 text-[#b6ff4a]" />
+                      View the finalized validator decision
+                      <ExternalLink className="ml-auto size-3.5" />
+                    </a>
+                  )}
                 </div>
               ) : (
                 <div className="flex min-h-[15.5rem] flex-col items-center justify-center px-5 text-center">
