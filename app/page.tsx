@@ -39,11 +39,14 @@ type ReviewState =
   | "idle"
   | "publishing-policy"
   | "policy-ready"
-  | "recording"
-  | "submitted"
+  | "funding"
+  | "awaiting-customer"
+  | "accepting-case"
+  | "ready"
   | "deliberating"
-  | "resolved";
-type PendingAction = "wallet" | "policy" | "submit" | "consensus" | "check" | null;
+  | "resolved"
+  | "manual-review";
+type PendingAction = "wallet" | "policy" | "submit" | "accept" | "consensus" | "check" | null;
 
 type EthereumProvider = {
   request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
@@ -64,29 +67,33 @@ type Decision = {
   decision: "REFUND_APPROVED" | "REFUND_REJECTED" | "MANUAL_REVIEW";
   rationale: string;
   key_fact: string;
+  settlement?: "CUSTOMER" | "MERCHANT" | "LOCKED_PENDING_BOTH_PARTIES";
+  escrow_amount_wei?: string;
 };
 
 const stages = [
-  { id: "policy", label: "Policy precommitted", detail: "Immutable policy hash published before the case" },
-  { id: "case", label: "Case recorded", detail: "Evidence linked to the published policy hash" },
+  { id: "policy", label: "Merchant policy committed", detail: "Policy hash is bound to the merchant wallet" },
+  { id: "escrow", label: "Escrow funded", detail: "Merchant locks native test GEN for this case" },
+  { id: "customer", label: "Customer accepted", detail: "Bound customer submits the claim separately" },
   { id: "deliberating", label: "Validators deliberating", detail: "Independent AI review in progress" },
-  { id: "resolved", label: "Decision finalized", detail: "Consensus committed onchain" },
+  { id: "resolved", label: "Escrow settlement", detail: "Decision routes GEN or keeps it jointly locked" },
 ] as const;
 
 const progressByState: Record<ReviewState, number> = {
   idle: 0,
   "publishing-policy": 12,
-  "policy-ready": 25,
-  recording: 38,
-  submitted: 50,
-  deliberating: 75,
+  "policy-ready": 20,
+  funding: 32,
+  "awaiting-customer": 45,
+  "accepting-case": 54,
+  ready: 64,
+  deliberating: 82,
   resolved: 100,
+  "manual-review": 92,
 };
 
-const contractAddress = "0x0dEe3259d5c17eE009080a4aA2e951D6b4a98220";
-const deploymentTx = "0x8507e55dfeca0027da7b370276bbfa6a625a1173bdd13af68d4d6bbf69360001";
-const samplePolicyHash = "9016999cbee63ee12c5f0fddf974bc849235ce09f425c3809f674504dd822c93";
-const samplePolicyTx = "0x404225214e3f8455b467d496c3dc1e90520607bcb59161012c508433363ab68a";
+const contractAddress = "0xf7a96A3e207B244fd9BdF8Ee0904285eb30fd501";
+const deploymentTx = "0xfdacf11b438a59ac6e2701c11681345722c28017a284765d9bb791a792a915f0";
 const explorerBase = "https://explorer-studio.genlayer.com/tx";
 const contractExplorerBase = "https://explorer-studio.genlayer.com/address";
 const siteUrl = "https://returnguard-genlayer.mustafaiciren.chatgpt.site";
@@ -199,6 +206,19 @@ function shortAddress(address: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
+function isAddress(value: string) {
+  return /^0x[0-9a-fA-F]{40}$/.test(value.trim());
+}
+
+function parseGenAmount(value: string) {
+  const normalized = value.trim();
+  if (!/^\d+(\.\d{1,18})?$/.test(normalized)) throw new Error("Enter a valid escrow amount with up to 18 decimals.");
+  const [whole, fraction = ""] = normalized.split(".");
+  const amount = BigInt(whole) * 10n ** 18n + BigInt((fraction + "0".repeat(18)).slice(0, 18));
+  if (amount <= 0n) throw new Error("Escrow must be greater than zero GEN.");
+  return amount;
+}
+
 function walletErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string") return error;
@@ -262,11 +282,14 @@ export default function Home() {
   const [policyHash, setPolicyHash] = useState<string | null>(null);
   const [policyTxHash, setPolicyTxHash] = useState<string | null>(null);
   const [caseTxHash, setCaseTxHash] = useState<string | null>(null);
+  const [acceptanceTxHash, setAcceptanceTxHash] = useState<string | null>(null);
   const [decisionTxHash, setDecisionTxHash] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision | null>(null);
   const [walletNotice, setWalletNotice] = useState<string | null>(null);
   const [orderId, setOrderId] = useState("RG-4821");
   const [category, setCategory] = useState("electronics");
+  const [customerAddress, setCustomerAddress] = useState("");
+  const [escrowAmount, setEscrowAmount] = useState("0.01");
   const [policy, setPolicy] = useState(
     "Returns are accepted within 14 days when the product is unused and the original packaging is undamaged. Opened or visibly used products are not eligible unless defective."
   );
@@ -278,6 +301,9 @@ export default function Home() {
   );
   const [evidence, setEvidence] = useState(
     "Courier record: parcel delivered without reported damage. Merchant photos: torn box corner, removed seal, fingerprints on stand. Customer confirms the monitor was tested."
+  );
+  const [customerEvidence, setCustomerEvidence] = useState(
+    "Customer delivery photos and the order receipt are attached."
   );
 
   useEffect(() => {
@@ -368,24 +394,38 @@ export default function Home() {
       toast.error("Publish the policy onchain before submitting the case.");
       return false;
     }
-    if (!customerClaim.trim() || !merchantResponse.trim()) {
-      toast.error("Add both sides of the dispute first.");
+    if (!merchantResponse.trim()) {
+      toast.error("Add the merchant response first.");
       return false;
     }
     if (!orderId.trim()) {
       toast.error("Add an order reference first.");
       return false;
     }
+    if (!isAddress(customerAddress)) {
+      toast.error("Add the customer's GenLayer wallet address.");
+      return false;
+    }
+    if (walletAddress?.toLowerCase() === customerAddress.trim().toLowerCase()) {
+      toast.error("Merchant and customer must use different wallets.");
+      return false;
+    }
+    try {
+      parseGenAmount(escrowAmount);
+    } catch (error) {
+      toast.error(readableWalletError(error));
+      return false;
+    }
     return true;
   };
 
-  const policyExistsOnchain = async (hash: string) => {
+  const policyExistsOnchain = async (hash: string, merchant: string) => {
     const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
     const readClient = createClient({ chain: studionet });
     const exists = await readClient.readContract({
       address: contractAddress,
-      functionName: "policy_exists",
-      args: [hash],
+      functionName: "policy_exists_for",
+      args: [merchant, hash],
       transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
     });
     return exists === true;
@@ -393,14 +433,17 @@ export default function Home() {
 
   const checkPolicyStatus = async () => {
     if (!validatePolicy()) return;
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
     setPendingAction("check");
     try {
       const hash = await sha256Hex(policy.trim());
-      if (await policyExistsOnchain(hash)) {
+      if (await policyExistsOnchain(hash, walletAddress)) {
         setPolicyHash(hash);
-        if (hash === samplePolicyHash) setPolicyTxHash(samplePolicyTx);
         setReviewState("policy-ready");
-        toast.success("Policy is locked onchain. The case can now reference its hash.");
+        toast.success("This merchant wallet has committed the policy onchain.");
       } else {
         toast.info("The policy transaction is still being processed.");
       }
@@ -426,10 +469,9 @@ export default function Home() {
 
     let txHash: `0x${string}` | undefined;
     try {
-      if (await policyExistsOnchain(hash)) {
-        if (hash === samplePolicyHash) setPolicyTxHash(samplePolicyTx);
+      if (await policyExistsOnchain(hash, walletAddress)) {
         setReviewState("policy-ready");
-        toast.success("This exact policy was already published onchain.");
+        toast.success("This merchant wallet already committed the policy.");
         return;
       }
 
@@ -454,12 +496,12 @@ export default function Home() {
       if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
         throw new Error("The contract rejected the policy transaction.");
       }
-      if (!(await policyExistsOnchain(hash))) {
+      if (!(await policyExistsOnchain(hash, walletAddress))) {
         throw new Error("The policy is still finalizing. Check again in a moment.");
       }
 
       setReviewState("policy-ready");
-      toast.success("Policy published first. The case can now reference its hash.");
+      toast.success("Merchant policy committed. The case can now be funded.");
     } catch (error) {
       if (txHash) {
         setReviewState("publishing-policy");
@@ -490,8 +532,25 @@ export default function Home() {
     setPendingAction("check");
     try {
       if (await caseExistsOnchain()) {
-        setReviewState("submitted");
-        toast.success("Case is recorded onchain. It is ready for AI consensus.");
+        const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
+        const readClient = createClient({ chain: studionet });
+        const status = await readClient.readContract({
+          address: contractAddress,
+          functionName: "get_case_status",
+          args: [orderId.trim()],
+          transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
+        });
+        if (status === "AWAITING_CUSTOMER") {
+          setReviewState("awaiting-customer");
+          toast.success("Escrow is funded. The bound customer must accept next.");
+        } else if (status === "READY") {
+          setReviewState("ready");
+          toast.success("Customer accepted. The case is ready for AI consensus.");
+        } else if (status === "SETTLEMENT_QUEUED") {
+          await checkDecision();
+        } else if (status === "MANUAL_REVIEW") {
+          await checkDecision();
+        }
       } else {
         toast.info("The case transaction is still being processed.");
       }
@@ -510,7 +569,7 @@ export default function Home() {
     }
 
     setPendingAction("submit");
-    setReviewState("recording");
+    setReviewState("funding");
     setDecision(null);
     setDecisionTxHash(null);
 
@@ -530,11 +589,11 @@ export default function Home() {
           orderId.trim(),
           category,
           policyHash,
-          customerClaim.trim(),
+          customerAddress.trim(),
           merchantResponse.trim(),
           evidence.trim(),
         ],
-        value: 0n,
+        value: parseGenAmount(escrowAmount),
         leaderOnly: true,
       });
       setCaseTxHash(txHash);
@@ -549,14 +608,67 @@ export default function Home() {
         throw new Error("The contract rejected the case transaction.");
       }
 
-      setReviewState("submitted");
-      toast.success("Case recorded onchain. Now start AI consensus.");
+      setReviewState("awaiting-customer");
+      toast.success("Escrow funded. Switch to the bound customer wallet to accept the case.");
     } catch (error) {
       if (txHash) {
-        setReviewState("recording");
+        setReviewState("funding");
         toast.error("The transaction was submitted but is still processing. Check its status before trying again.");
       } else {
         setReviewState("idle");
+        toast.error(readableWalletError(error));
+      }
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const acceptCase = async () => {
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+    if (walletAddress.toLowerCase() !== customerAddress.trim().toLowerCase()) {
+      toast.error(`Switch MetaMask to the customer wallet: ${shortAddress(customerAddress.trim())}`);
+      return;
+    }
+    if (!customerClaim.trim()) {
+      toast.error("The customer must add a claim before accepting.");
+      return;
+    }
+
+    setPendingAction("accept");
+    setReviewState("accepting-case");
+    let txHash: `0x${string}` | undefined;
+    try {
+      const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
+      const readClient = createClient({ chain: studionet });
+      const client = await createWalletClient(walletAddress);
+      txHash = await client.writeContract({
+        address: contractAddress,
+        functionName: "accept_case",
+        args: [orderId.trim(), customerClaim.trim(), customerEvidence.trim()],
+        value: 0n,
+        leaderOnly: true,
+      });
+      setAcceptanceTxHash(txHash);
+      const receipt = await readClient.waitForTransactionReceipt({
+        hash: txHash,
+        status: TransactionStatus.ACCEPTED,
+        interval: 2_000,
+        retries: 90,
+      });
+      if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        throw new Error("The contract rejected the customer acceptance.");
+      }
+      setReviewState("ready");
+      toast.success("Customer identity verified. The case is ready for AI consensus.");
+    } catch (error) {
+      if (txHash) {
+        setReviewState("accepting-case");
+        toast.error("Acceptance was submitted and may still be processing. Check the case status.");
+      } else {
+        setReviewState("awaiting-customer");
         toast.error(readableWalletError(error));
       }
     } finally {
@@ -585,8 +697,8 @@ export default function Home() {
         return;
       }
       setDecision(currentDecision);
-      setReviewState("resolved");
-      toast.success("AI consensus decision is ready.");
+      setReviewState(currentDecision.decision === "MANUAL_REVIEW" ? "manual-review" : "resolved");
+      toast.success(currentDecision.decision === "MANUAL_REVIEW" ? "Manual review locked the escrow." : "Decision finalized and escrow settlement queued.");
     } catch (error) {
       toast.error(readableWalletError(error));
     } finally {
@@ -629,14 +741,14 @@ export default function Home() {
       const currentDecision = await readDecision();
       if (!currentDecision) throw new Error("The decision is finalizing. Check again in a moment.");
       setDecision(currentDecision);
-      setReviewState("resolved");
-      toast.success("AI consensus finalized onchain.");
+      setReviewState(currentDecision.decision === "MANUAL_REVIEW" ? "manual-review" : "resolved");
+      toast.success(currentDecision.decision === "MANUAL_REVIEW" ? "Manual review: escrow remains locked for both parties." : "AI consensus finalized and routed the escrow.");
     } catch (error) {
       if (txHash) {
         setReviewState("deliberating");
         toast.error("Consensus was submitted and may still be running. Use Check decision instead of resubmitting.");
       } else {
-        setReviewState("submitted");
+        setReviewState("ready");
         toast.error(readableWalletError(error));
       }
     } finally {
@@ -661,11 +773,15 @@ export default function Home() {
       await submitCase();
       return;
     }
-    if (reviewState === "recording") {
+    if (reviewState === "funding" || reviewState === "accepting-case") {
       await checkCaseStatus();
       return;
     }
-    if (reviewState === "submitted") {
+    if (reviewState === "awaiting-customer") {
+      await acceptCase();
+      return;
+    }
+    if (reviewState === "ready") {
       await runConsensus();
       return;
     }
@@ -678,39 +794,53 @@ export default function Home() {
   const primaryLabel = () => {
     if (pendingAction === "wallet") return "Connecting wallet";
     if (pendingAction === "policy") return "Publishing policy";
-    if (pendingAction === "submit") return "Recording case";
+    if (pendingAction === "submit") return "Funding escrow";
+    if (pendingAction === "accept") return "Accepting as customer";
     if (pendingAction === "consensus") return "Starting consensus";
     if (pendingAction === "check") return "Checking chain";
     if (!walletAddress) return "Connect wallet";
     if (reviewState === "idle") return "Publish policy onchain";
     if (reviewState === "publishing-policy") return "Check policy status";
-    if (reviewState === "policy-ready") return "Submit case onchain";
-    if (reviewState === "recording") return "Check case status";
-    if (reviewState === "submitted") return "Run AI consensus";
+    if (reviewState === "policy-ready") return "Fund case escrow";
+    if (reviewState === "funding" || reviewState === "accepting-case") return "Check case status";
+    if (reviewState === "awaiting-customer") {
+      return walletAddress?.toLowerCase() === customerAddress.trim().toLowerCase()
+        ? "Accept as customer"
+        : "Switch to customer wallet";
+    }
+    if (reviewState === "ready") return "Run AI consensus";
     if (reviewState === "deliberating") return "Check decision";
-    return "Decision finalized";
+    if (reviewState === "manual-review") return "Escrow locked for agreement";
+    return "Escrow settlement queued";
   };
 
   const completedStages: Record<ReviewState, number> = {
     idle: 0,
     "publishing-policy": 0,
     "policy-ready": 1,
-    recording: 1,
-    submitted: 2,
-    deliberating: 2,
-    resolved: 4,
+    funding: 1,
+    "awaiting-customer": 2,
+    "accepting-case": 2,
+    ready: 3,
+    deliberating: 3,
+    resolved: 5,
+    "manual-review": 4,
   };
   const activeStageByState: Record<ReviewState, number | null> = {
     idle: null,
     "publishing-policy": 0,
     "policy-ready": null,
-    recording: 1,
-    submitted: null,
-    deliberating: 2,
+    funding: 1,
+    "awaiting-customer": 2,
+    "accepting-case": 2,
+    ready: 3,
+    deliberating: 3,
     resolved: null,
+    "manual-review": 4,
   };
   const activeStage = activeStageByState[reviewState];
-  const formLocked = ["recording", "submitted", "deliberating", "resolved"].includes(reviewState);
+  const formLocked = ["funding", "awaiting-customer", "accepting-case", "ready", "deliberating", "resolved", "manual-review"].includes(reviewState);
+  const customerFieldsLocked = ["funding", "accepting-case", "ready", "deliberating", "resolved", "manual-review"].includes(reviewState);
   const policyLocked = reviewState === "publishing-policy" || formLocked;
 
   return (
@@ -767,7 +897,7 @@ export default function Home() {
             </h1>
           </div>
           <p className="max-w-md text-[15px] leading-6 text-[#94a79e]">
-            Publish the policy first, then submit a case bound to its immutable hash. Independent validators review the evidence and record the outcome.
+            The merchant commits a policy and funds GEN escrow. The bound customer accepts separately, then validator consensus routes the funds.
           </p>
         </section>
 
@@ -846,7 +976,7 @@ export default function Home() {
                 </div>
                 <div>
                   <h2 className="font-medium text-white">New dispute</h2>
-                  <p className="mt-0.5 text-sm text-[#7f9389]">Both sides are visible to the validator set.</p>
+                  <p className="mt-0.5 text-sm text-[#7f9389]">Two wallets, separate claims, one funded settlement.</p>
                 </div>
               </div>
               <Badge variant="outline" className="border-white/10 font-mono text-[#7f9389]">
@@ -881,6 +1011,29 @@ export default function Home() {
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-[1.45fr_0.55fr]">
+                <Field label="Customer wallet" htmlFor="customer-wallet" hint="Must differ from the merchant wallet">
+                  <Input
+                    id="customer-wallet"
+                    value={customerAddress}
+                    onChange={(event) => setCustomerAddress(event.target.value)}
+                    disabled={formLocked}
+                    placeholder="0x..."
+                    className="h-11 border-white/10 bg-black/15 font-mono text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
+                <Field label="Escrow (test GEN)" htmlFor="escrow-amount">
+                  <Input
+                    id="escrow-amount"
+                    inputMode="decimal"
+                    value={escrowAmount}
+                    onChange={(event) => setEscrowAmount(event.target.value)}
+                    disabled={formLocked}
+                    className="h-11 border-white/10 bg-black/15 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
               </div>
 
               <Field label="Return policy" htmlFor="policy" hint="The rulebook validators must apply">
@@ -922,7 +1075,7 @@ export default function Home() {
                     id="customer-claim"
                     value={customerClaim}
                     onChange={(event) => setCustomerClaim(event.target.value)}
-                    disabled={formLocked}
+                    disabled={customerFieldsLocked}
                     className="min-h-32 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
                   />
                 </Field>
@@ -937,41 +1090,55 @@ export default function Home() {
                 </Field>
               </div>
 
-              <Field label="Evidence summary" htmlFor="evidence" hint="Links, photos, tracking records, or device logs">
-                <Textarea
-                  id="evidence"
-                  value={evidence}
-                  onChange={(event) => setEvidence(event.target.value)}
-                  disabled={formLocked}
-                  className="min-h-24 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
-                />
-              </Field>
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Field label="Customer evidence" htmlFor="customer-evidence" hint="Submitted by the bound customer">
+                  <Textarea
+                    id="customer-evidence"
+                    value={customerEvidence}
+                    onChange={(event) => setCustomerEvidence(event.target.value)}
+                    disabled={customerFieldsLocked}
+                    className="min-h-24 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
+                <Field label="Merchant evidence" htmlFor="evidence" hint="Submitted when escrow is funded">
+                  <Textarea
+                    id="evidence"
+                    value={evidence}
+                    onChange={(event) => setEvidence(event.target.value)}
+                    disabled={formLocked}
+                    className="min-h-24 resize-none border-white/10 bg-black/15 leading-6 text-white placeholder:text-[#617168] focus-visible:border-[#b6ff4a]/60 focus-visible:ring-[#b6ff4a]/15"
+                  />
+                </Field>
+              </div>
 
               <div className="flex flex-col gap-3 border-t border-white/8 pt-5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-2 text-sm text-[#81958a]">
                   <LockKeyhole className="size-4 text-[#b6ff4a]" />
-                  Cases can only reference a policy already recorded onchain.
+                  Only the policy-owning merchant can fund; only the named customer can accept.
                 </div>
                 <Button
                   type="button"
                   size="lg"
-                  disabled={pendingAction !== null || reviewState === "resolved"}
+                  disabled={pendingAction !== null || reviewState === "resolved" || reviewState === "manual-review"}
                   onClick={handlePrimaryAction}
                   className="h-11 rounded-xl bg-[#b6ff4a] px-5 font-semibold text-[#0a120f] shadow-[0_0_30px_rgba(182,255,74,0.13)] hover:bg-[#c8ff78]"
                 >
-                  {pendingAction ? <LoaderCircle className="size-4 animate-spin" /> : reviewState === "submitted" ? <BrainCircuit className="size-4" /> : reviewState === "deliberating" ? <Circle className="size-4" /> : reviewState === "idle" || reviewState === "publishing-policy" ? <LockKeyhole className="size-4" /> : <Send className="size-4" />}
+                  {pendingAction ? <LoaderCircle className="size-4 animate-spin" /> : reviewState === "ready" ? <BrainCircuit className="size-4" /> : reviewState === "deliberating" ? <Circle className="size-4" /> : reviewState === "idle" || reviewState === "publishing-policy" ? <LockKeyhole className="size-4" /> : <Send className="size-4" />}
                   {primaryLabel()}
-                  {!pendingAction && reviewState !== "deliberating" && <ArrowRight className="size-4" />}
+                  {!pendingAction && reviewState !== "deliberating" && reviewState !== "manual-review" && <ArrowRight className="size-4" />}
                 </Button>
               </div>
 
-              {(policyTxHash || caseTxHash || decisionTxHash) && (
-                <div className="grid gap-2 rounded-xl border border-white/8 bg-black/15 p-3 text-xs sm:grid-cols-3">
+              {(policyTxHash || caseTxHash || acceptanceTxHash || decisionTxHash) && (
+                <div className="grid gap-2 rounded-xl border border-white/8 bg-black/15 p-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
                   {policyTxHash && (
                     <TransactionLink label="Policy transaction" hash={policyTxHash} />
                   )}
                   {caseTxHash && (
-                    <TransactionLink label="Case transaction" hash={caseTxHash} />
+                    <TransactionLink label="Escrow transaction" hash={caseTxHash} />
+                  )}
+                  {acceptanceTxHash && (
+                    <TransactionLink label="Customer acceptance" hash={acceptanceTxHash} />
                   )}
                   {decisionTxHash && (
                     <TransactionLink label="Consensus transaction" hash={decisionTxHash} />
@@ -1021,8 +1188,8 @@ export default function Home() {
               </div>
             </section>
 
-            <section className={`decision-card rounded-[1.4rem] border p-5 sm:p-6 ${reviewState === "resolved" ? "is-resolved" : ""}`}>
-              {reviewState === "resolved" && decision ? (
+            <section className={`decision-card rounded-[1.4rem] border p-5 sm:p-6 ${reviewState === "resolved" || reviewState === "manual-review" ? "is-resolved" : ""}`}>
+              {(reviewState === "resolved" || reviewState === "manual-review") && decision ? (
                 <div className="animate-in fade-in slide-in-from-bottom-2 duration-500">
                   <div className="mb-5 flex items-start justify-between gap-3">
                     <div>
@@ -1042,10 +1209,21 @@ export default function Home() {
                     Key fact: <span className="font-medium text-[#d7e3dc]">{decision.key_fact}</span>
                   </p>
 
+                  <p className="mt-3 rounded-lg border border-[#b6ff4a]/15 bg-[#b6ff4a]/[0.04] px-3 py-2.5 text-xs leading-5 text-[#a9bbb1]">
+                    {decision.settlement === "CUSTOMER"
+                      ? `Escrow: ${escrowAmount} test GEN is queued for the customer when this transaction finalizes.`
+                      : decision.settlement === "MERCHANT"
+                        ? `Escrow: ${escrowAmount} test GEN is queued back to the merchant when this transaction finalizes.`
+                        : "Escrow remains locked. A manual settlement requires a proposal from one bound party and confirmation by the other."}
+                  </p>
+
                   <div className="mt-6 grid grid-cols-3 divide-x divide-white/10 rounded-xl border border-white/10 bg-black/15 py-4 text-center">
                     <Metric value="3 / 5" label="Quorum" />
                     <Metric value="Full AI" label="Consensus" />
-                    <Metric value="Finalized" label="Onchain" />
+                    <Metric
+                      value={decision.settlement === "CUSTOMER" ? "Customer" : decision.settlement === "MERCHANT" ? "Merchant" : "Locked"}
+                      label="Escrow"
+                    />
                   </div>
 
                   {decisionTxHash && (
@@ -1068,25 +1246,27 @@ export default function Home() {
                   </div>
                   <h2 className="font-medium text-[#c6d4cc]">No decision yet</h2>
                   <p className="mt-2 max-w-sm text-sm leading-6 text-[#71847a]">
-                    {reviewState === "submitted"
-                      ? "The case is onchain. Start AI consensus to ask the validator set for a decision."
+                    {reviewState === "ready"
+                      ? "Both wallet roles are verified. Either bound party can now start AI consensus."
                       : reviewState === "deliberating"
                         ? "The transaction is live. Validators are independently reviewing the policy and evidence."
-                        : reviewState === "recording"
-                          ? "Your signed case transaction is being recorded on GenLayer."
+                        : reviewState === "awaiting-customer"
+                          ? `Escrow is funded. Switch MetaMask to ${customerAddress ? shortAddress(customerAddress) : "the bound customer"} and accept the case.`
+                          : reviewState === "funding" || reviewState === "accepting-case"
+                            ? "The signed role or escrow transaction is being recorded on GenLayer."
                           : reviewState === "policy-ready"
-                            ? "The policy is locked onchain. Submit the case to bind its evidence to that policy hash."
+                            ? "The merchant policy is locked onchain. Name the customer and fund the case escrow."
                             : reviewState === "publishing-policy"
-                              ? "The policy commitment is being recorded before any case can reference it."
-                              : "Connect your wallet and publish the return policy before submitting a dispute."}
+                              ? "The merchant's policy commitment is being recorded before the case exists."
+                              : "Connect the merchant wallet and publish its return policy before funding a dispute."}
                   </p>
                 </div>
               )}
             </section>
 
             <div className="grid grid-cols-2 gap-3">
-              <ProtocolCard icon={<Scale className="size-4" />} title="Policy-bound" copy="Judgment follows merchant rules." />
-              <ProtocolCard icon={<ShieldCheck className="size-4" />} title="Auditable" copy="Decision and rationale stay verifiable." />
+              <ProtocolCard icon={<Scale className="size-4" />} title="Role-bound" copy="Merchant and customer sign separately." />
+              <ProtocolCard icon={<ShieldCheck className="size-4" />} title="GEN escrow" copy="The decision moves testnet funds." />
             </div>
           </aside>
         </div>

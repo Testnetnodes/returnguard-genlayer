@@ -7,8 +7,14 @@
     "case_id": "EXAMPLE-001",
     "category": "example",
     "policy_hash": "47df6d1f75b3d3a95a4dccbbf0c0ba63c6c2a8a512c9b1689330cf0a759b6659",
-    "customer_claim": "Example customer claim.",
+    "customer": "0x2222222222222222222222222222222222222222",
     "merchant_response": "Example merchant response.",
-    "evidence_summary": "Example evidence summary."
+    "merchant_evidence": "Example merchant evidence.",
+    "escrow_amount_wei": "10000000000000000"
+  },
+  "customer_acceptance": {
+    "case_id": "EXAMPLE-001",
+    "customer_claim": "Example customer claim.",
+    "customer_evidence": "Example customer evidence."
   }
 }
