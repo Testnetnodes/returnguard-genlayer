@@ -252,11 +252,12 @@ Return JSON with exactly these fields:
 
             validator_result = leader_fn()
             proposed = leader_result.calldata
-            return (
-                proposed["decision"] == validator_result["decision"]
-                and proposed["policy_test"] == validator_result["policy_test"]
-                and abs(proposed["confidence"] - validator_result["confidence"]) <= 15
-            )
+            # Consensus is intentionally bound only to the normalized decision
+            # enum. Rationale, policy_test, confidence, and key_fact are
+            # explanatory metadata and are not compared: independent validators
+            # may reach the same decision while expressing their reasons
+            # differently.
+            return proposed["decision"] == validator_result["decision"]
 
         accepted = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         decision = dict(accepted)
@@ -279,15 +280,23 @@ Return JSON with exactly these fields:
         self.decisions[case_id] = json.dumps(decision, sort_keys=True)
 
     @gl.public.write
-    def propose_manual_settlement(self, case_id: str, pay_customer: bool) -> None:
+    def propose_manual_settlement(self, case_id: str, recipient: str, rationale: str) -> None:
         self._require_case(case_id)
         self._require_party(case_id)
         if self.case_statuses.get(case_id, "") != "MANUAL_REVIEW":
             raise gl.vm.UserError("[EXPECTED] case is not in manual review")
 
+        normalized_recipient = recipient.upper()
+        if normalized_recipient not in ("CUSTOMER", "MERCHANT"):
+            raise gl.vm.UserError("[EXPECTED] recipient must be CUSTOMER or MERCHANT")
+        if not rationale or len(rationale) > 1000:
+            raise gl.vm.UserError("[EXPECTED] manual rationale must contain 1-1,000 characters")
+
         proposal = {
-            "pay_customer": pay_customer,
+            "recipient": normalized_recipient,
+            "rationale": rationale,
             "proposer": str(gl.message.sender_address),
+            "proposed_at": gl.message_raw["datetime"],
         }
         self.manual_proposals[case_id] = json.dumps(proposal, sort_keys=True)
 
@@ -305,7 +314,17 @@ Return JSON with exactly these fields:
         if proposal["proposer"].lower() == str(gl.message.sender_address).lower():
             raise gl.vm.UserError("[EXPECTED] the other party must confirm the proposal")
 
-        recipient = self.customers[case_id] if proposal["pay_customer"] else self.merchants[case_id]
+        recipient_name = proposal["recipient"]
+        recipient = self.customers[case_id] if recipient_name == "CUSTOMER" else self.merchants[case_id]
+
+        decision = json.loads(self.decisions[case_id])
+        decision["settlement"] = recipient_name
+        decision["manual_resolution"] = recipient_name
+        decision["manual_rationale"] = proposal["rationale"]
+        decision["manual_proposer"] = proposal["proposer"]
+        decision["manual_confirmer"] = str(gl.message.sender_address)
+        decision["manual_resolved_at"] = gl.message_raw["datetime"]
+        self.decisions[case_id] = json.dumps(decision, sort_keys=True)
         self.case_statuses[case_id] = "SETTLEMENT_QUEUED"
         self._release_escrow(case_id, recipient)
 
@@ -338,6 +357,10 @@ Return JSON with exactly these fields:
     @gl.public.view
     def get_escrow_amount(self, case_id: str) -> u256:
         return self.escrow_amounts.get(case_id, u256(0))
+
+    @gl.public.view
+    def get_manual_proposal(self, case_id: str) -> str:
+        return self.manual_proposals.get(case_id, "")
 
     @gl.public.view
     def get_parties(self, case_id: str) -> str:

@@ -46,7 +46,16 @@ type ReviewState =
   | "deliberating"
   | "resolved"
   | "manual-review";
-type PendingAction = "wallet" | "policy" | "submit" | "accept" | "consensus" | "check" | null;
+type PendingAction =
+  | "wallet"
+  | "policy"
+  | "submit"
+  | "accept"
+  | "consensus"
+  | "check"
+  | "manual-propose"
+  | "manual-confirm"
+  | null;
 
 type EthereumProvider = {
   request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
@@ -69,13 +78,24 @@ type Decision = {
   key_fact: string;
   settlement?: "CUSTOMER" | "MERCHANT" | "LOCKED_PENDING_BOTH_PARTIES";
   escrow_amount_wei?: string;
+  manual_resolution?: "CUSTOMER" | "MERCHANT";
+  manual_rationale?: string;
+  manual_proposer?: string;
+  manual_confirmer?: string;
+};
+
+type ManualProposal = {
+  recipient: "CUSTOMER" | "MERCHANT";
+  rationale: string;
+  proposer: string;
+  proposed_at: string;
 };
 
 const stages = [
   { id: "policy", label: "Merchant policy committed", detail: "Policy hash is bound to the merchant wallet" },
   { id: "escrow", label: "Escrow funded", detail: "Merchant locks native test GEN for this case" },
   { id: "customer", label: "Customer accepted", detail: "Bound customer submits the claim separately" },
-  { id: "deliberating", label: "Validators deliberating", detail: "Independent AI review in progress" },
+  { id: "deliberating", label: "Validators deliberating", detail: "Consensus compares the decision enum only, never rationale wording" },
   { id: "resolved", label: "Escrow settlement", detail: "Decision routes GEN or keeps it jointly locked" },
 ] as const;
 
@@ -92,8 +112,8 @@ const progressByState: Record<ReviewState, number> = {
   "manual-review": 92,
 };
 
-const contractAddress = "0xf7a96A3e207B244fd9BdF8Ee0904285eb30fd501";
-const deploymentTx = "0xfdacf11b438a59ac6e2701c11681345722c28017a284765d9bb791a792a915f0";
+const contractAddress = "0x64E8C5D7A4E8627e83Fe80e10d10681E944f5e58";
+const deploymentTx = "0xe64d3875860889ab795ff95d8b9bac237ef06ff39a68025e1ff64b7af6209f5f";
 const explorerBase = "https://explorer-studio.genlayer.com/tx";
 const contractExplorerBase = "https://explorer-studio.genlayer.com/address";
 const siteUrl = "https://returnguard-genlayer.mustafaiciren.chatgpt.site";
@@ -268,9 +288,31 @@ function parseDecision(value: unknown): Decision | null {
   }
 }
 
-function decisionTitle(decision: Decision["decision"]) {
-  if (decision === "REFUND_APPROVED") return "Refund approved";
-  if (decision === "MANUAL_REVIEW") return "Manual review";
+function parseManualProposal(value: unknown): ManualProposal | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<ManualProposal>;
+    if (
+      !parsed.recipient ||
+      !["CUSTOMER", "MERCHANT"].includes(parsed.recipient) ||
+      typeof parsed.rationale !== "string" ||
+      typeof parsed.proposer !== "string" ||
+      typeof parsed.proposed_at !== "string"
+    ) {
+      return null;
+    }
+    return parsed as ManualProposal;
+  } catch {
+    return null;
+  }
+}
+
+function decisionTitle(decision: Decision) {
+  if (decision.decision === "REFUND_APPROVED") return "Refund approved";
+  if (decision.decision === "MANUAL_REVIEW" && decision.settlement !== "LOCKED_PENDING_BOTH_PARTIES") {
+    return "Manual settlement finalized";
+  }
+  if (decision.decision === "MANUAL_REVIEW") return "Manual review";
   return "Refund rejected";
 }
 
@@ -284,7 +326,12 @@ export default function Home() {
   const [caseTxHash, setCaseTxHash] = useState<string | null>(null);
   const [acceptanceTxHash, setAcceptanceTxHash] = useState<string | null>(null);
   const [decisionTxHash, setDecisionTxHash] = useState<string | null>(null);
+  const [manualProposalTxHash, setManualProposalTxHash] = useState<string | null>(null);
+  const [manualSettlementTxHash, setManualSettlementTxHash] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision | null>(null);
+  const [manualProposal, setManualProposal] = useState<ManualProposal | null>(null);
+  const [manualRecipient, setManualRecipient] = useState<"CUSTOMER" | "MERCHANT">("CUSTOMER");
+  const [manualRationale, setManualRationale] = useState("");
   const [walletNotice, setWalletNotice] = useState<string | null>(null);
   const [orderId, setOrderId] = useState("RG-4821");
   const [category, setCategory] = useState("electronics");
@@ -572,6 +619,9 @@ export default function Home() {
     setReviewState("funding");
     setDecision(null);
     setDecisionTxHash(null);
+    setManualProposal(null);
+    setManualProposalTxHash(null);
+    setManualSettlementTxHash(null);
 
     let txHash: `0x${string}` | undefined;
     try {
@@ -688,6 +738,29 @@ export default function Home() {
     return parseDecision(result);
   };
 
+  const readCaseStatus = async () => {
+    const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
+    const readClient = createClient({ chain: studionet });
+    return readClient.readContract({
+      address: contractAddress,
+      functionName: "get_case_status",
+      args: [orderId.trim()],
+      transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
+    });
+  };
+
+  const readManualProposal = async () => {
+    const { createClient, studionet, TransactionHashVariant } = await loadGenLayer();
+    const readClient = createClient({ chain: studionet });
+    const result = await readClient.readContract({
+      address: contractAddress,
+      functionName: "get_manual_proposal",
+      args: [orderId.trim()],
+      transactionHashVariant: TransactionHashVariant.LATEST_NONFINAL,
+    });
+    return parseManualProposal(result);
+  };
+
   const checkDecision = async () => {
     setPendingAction("check");
     try {
@@ -696,9 +769,14 @@ export default function Home() {
         toast.info("Validators are still reviewing this case.");
         return;
       }
+      const status = await readCaseStatus();
       setDecision(currentDecision);
-      setReviewState(currentDecision.decision === "MANUAL_REVIEW" ? "manual-review" : "resolved");
-      toast.success(currentDecision.decision === "MANUAL_REVIEW" ? "Manual review locked the escrow." : "Decision finalized and escrow settlement queued.");
+      const needsManualAgreement = currentDecision.decision === "MANUAL_REVIEW" && status === "MANUAL_REVIEW";
+      setReviewState(needsManualAgreement ? "manual-review" : "resolved");
+      if (needsManualAgreement) {
+        setManualProposal(await readManualProposal());
+      }
+      toast.success(needsManualAgreement ? "Manual review is ready for a two-party settlement." : "Decision finalized and escrow settlement queued.");
     } catch (error) {
       toast.error(readableWalletError(error));
     } finally {
@@ -742,6 +820,7 @@ export default function Home() {
       if (!currentDecision) throw new Error("The decision is finalizing. Check again in a moment.");
       setDecision(currentDecision);
       setReviewState(currentDecision.decision === "MANUAL_REVIEW" ? "manual-review" : "resolved");
+      if (currentDecision.decision === "MANUAL_REVIEW") setManualProposal(await readManualProposal());
       toast.success(currentDecision.decision === "MANUAL_REVIEW" ? "Manual review: escrow remains locked for both parties." : "AI consensus finalized and routed the escrow.");
     } catch (error) {
       if (txHash) {
@@ -751,6 +830,101 @@ export default function Home() {
         setReviewState("ready");
         toast.error(readableWalletError(error));
       }
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const proposeManualSettlement = async () => {
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+    if (!manualRationale.trim()) {
+      toast.error("Explain why both parties should accept this settlement.");
+      return;
+    }
+
+    setPendingAction("manual-propose");
+    let txHash: `0x${string}` | undefined;
+    try {
+      const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
+      const readClient = createClient({ chain: studionet });
+      const client = await createWalletClient(walletAddress);
+      txHash = await client.writeContract({
+        address: contractAddress,
+        functionName: "propose_manual_settlement",
+        args: [orderId.trim(), manualRecipient, manualRationale.trim()],
+        value: 0n,
+        leaderOnly: true,
+      });
+      setManualProposalTxHash(txHash);
+      const receipt = await readClient.waitForTransactionReceipt({
+        hash: txHash,
+        status: TransactionStatus.ACCEPTED,
+        interval: 2_000,
+        retries: 90,
+      });
+      if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        throw new Error("The contract rejected the manual settlement proposal.");
+      }
+      const proposal = await readManualProposal();
+      if (!proposal) throw new Error("The proposal is still finalizing. Check again in a moment.");
+      setManualProposal(proposal);
+      toast.success("Settlement proposal recorded. The other bound party must confirm it.");
+    } catch (error) {
+      toast.error(txHash ? "The proposal was submitted and may still be processing. Check the case again." : readableWalletError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const confirmManualSettlement = async () => {
+    if (!walletAddress) {
+      await connectWallet();
+      return;
+    }
+    if (!manualProposal) {
+      toast.error("No manual settlement proposal is available yet.");
+      return;
+    }
+    if (manualProposal.proposer.toLowerCase() === walletAddress.toLowerCase()) {
+      toast.error("Switch to the other bound party's wallet to confirm this proposal.");
+      return;
+    }
+
+    setPendingAction("manual-confirm");
+    let txHash: `0x${string}` | undefined;
+    try {
+      const { createClient, studionet, ExecutionResult, TransactionStatus } = await loadGenLayer();
+      const readClient = createClient({ chain: studionet });
+      const client = await createWalletClient(walletAddress);
+      txHash = await client.writeContract({
+        address: contractAddress,
+        functionName: "confirm_manual_settlement",
+        args: [orderId.trim()],
+        value: 0n,
+        leaderOnly: true,
+      });
+      setManualSettlementTxHash(txHash);
+      const receipt = await readClient.waitForTransactionReceipt({
+        hash: txHash,
+        status: TransactionStatus.ACCEPTED,
+        interval: 2_000,
+        retries: 90,
+      });
+      if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+        throw new Error("The contract rejected the manual settlement confirmation.");
+      }
+      const currentDecision = await readDecision();
+      if (!currentDecision || currentDecision.settlement === "LOCKED_PENDING_BOTH_PARTIES") {
+        throw new Error("The settlement is still finalizing. Check again in a moment.");
+      }
+      setDecision(currentDecision);
+      setReviewState("resolved");
+      toast.success("Both parties agreed. The escrow settlement is queued.");
+    } catch (error) {
+      toast.error(txHash ? "Confirmation was submitted and may still be processing. Check the decision again." : readableWalletError(error));
     } finally {
       setPendingAction(null);
     }
@@ -1129,7 +1303,7 @@ export default function Home() {
                 </Button>
               </div>
 
-              {(policyTxHash || caseTxHash || acceptanceTxHash || decisionTxHash) && (
+              {(policyTxHash || caseTxHash || acceptanceTxHash || decisionTxHash || manualProposalTxHash || manualSettlementTxHash) && (
                 <div className="grid gap-2 rounded-xl border border-white/8 bg-black/15 p-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
                   {policyTxHash && (
                     <TransactionLink label="Policy transaction" hash={policyTxHash} />
@@ -1142,6 +1316,12 @@ export default function Home() {
                   )}
                   {decisionTxHash && (
                     <TransactionLink label="Consensus transaction" hash={decisionTxHash} />
+                  )}
+                  {manualProposalTxHash && (
+                    <TransactionLink label="Settlement proposal" hash={manualProposalTxHash} />
+                  )}
+                  {manualSettlementTxHash && (
+                    <TransactionLink label="Settlement confirmation" hash={manualSettlementTxHash} />
                   )}
                 </div>
               )}
@@ -1193,8 +1373,10 @@ export default function Home() {
                 <div className="animate-in fade-in slide-in-from-bottom-2 duration-500">
                   <div className="mb-5 flex items-start justify-between gap-3">
                     <div>
-                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb367]">Final decision</p>
-                      <h2 className="text-2xl font-semibold tracking-[-0.03em] text-white">{decisionTitle(decision.decision)}</h2>
+                      <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-[#ffb367]">
+                        {reviewState === "manual-review" ? "AI decision · agreement required" : "Final decision"}
+                      </p>
+                      <h2 className="text-2xl font-semibold tracking-[-0.03em] text-white">{decisionTitle(decision)}</h2>
                     </div>
                     <div className="consensus-seal flex size-14 items-center justify-center rounded-full border border-[#ff9b3f]/40 bg-[#ff9b3f]/10">
                       <Scale className="size-6 text-[#ffad5f]" />
@@ -1216,6 +1398,84 @@ export default function Home() {
                         ? `Escrow: ${escrowAmount} test GEN is queued back to the merchant when this transaction finalizes.`
                         : "Escrow remains locked. A manual settlement requires a proposal from one bound party and confirmation by the other."}
                   </p>
+
+                  {reviewState === "manual-review" && (
+                    <div className="mt-4 space-y-3 rounded-xl border border-[#41d6ff]/20 bg-[#41d6ff]/[0.035] p-4">
+                      <div>
+                        <p className="text-sm font-semibold text-white">Resolve with both parties</p>
+                        <p className="mt-1 text-xs leading-5 text-[#91a79d]">
+                          A bound party records the recipient and rationale onchain. The other bound party must confirm the exact proposal before escrow moves.
+                        </p>
+                      </div>
+
+                      {manualProposal && (
+                        <div className="rounded-lg border border-white/10 bg-black/20 p-3 text-xs leading-5 text-[#b8c8c0]">
+                          <p>
+                            Proposed recipient: <span className="font-semibold text-white">{manualProposal.recipient === "CUSTOMER" ? "Customer" : "Merchant"}</span>
+                          </p>
+                          <p className="mt-1">{manualProposal.rationale}</p>
+                          <p className="mt-2 font-mono text-[11px] text-[#71877c]">Proposed by {shortAddress(manualProposal.proposer)}</p>
+                        </div>
+                      )}
+
+                      <div className="grid gap-3 sm:grid-cols-[0.8fr_1.2fr]">
+                        <Select
+                          value={manualRecipient}
+                          onValueChange={(value) => setManualRecipient(value as "CUSTOMER" | "MERCHANT")}
+                          disabled={pendingAction !== null}
+                        >
+                          <SelectTrigger className="border-white/10 bg-black/15 text-white">
+                            <SelectValue aria-label="Settlement recipient" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="CUSTOMER">Pay customer</SelectItem>
+                            <SelectItem value="MERCHANT">Return to merchant</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <Textarea
+                          value={manualRationale}
+                          onChange={(event) => setManualRationale(event.target.value)}
+                          disabled={pendingAction !== null}
+                          maxLength={1000}
+                          placeholder="Explain the agreed settlement basis."
+                          aria-label="Manual settlement rationale"
+                          className="min-h-20 resize-none border-white/10 bg-black/15 text-white placeholder:text-[#617168] focus-visible:border-[#41d6ff]/60 focus-visible:ring-[#41d6ff]/15"
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={pendingAction !== null}
+                          onClick={proposeManualSettlement}
+                          className="border-[#41d6ff]/30 bg-[#41d6ff]/5 text-[#8be7ff] hover:bg-[#41d6ff]/10 hover:text-white"
+                        >
+                          {pendingAction === "manual-propose" ? <LoaderCircle className="size-4 animate-spin" /> : <FileText className="size-4" />}
+                          Record proposal
+                        </Button>
+                        {manualProposal && (
+                          <Button
+                            type="button"
+                            disabled={pendingAction !== null}
+                            onClick={confirmManualSettlement}
+                            className="bg-[#b6ff4a] font-semibold text-[#0a120f] hover:bg-[#c8ff78]"
+                          >
+                            {pendingAction === "manual-confirm" ? <LoaderCircle className="size-4 animate-spin" /> : <Check className="size-4" />}
+                            Confirm & release escrow
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {decision.manual_rationale && (
+                    <div className="mt-4 rounded-xl border border-[#41d6ff]/20 bg-[#41d6ff]/[0.035] p-3 text-xs leading-5 text-[#b8c8c0]">
+                      <p className="font-semibold text-[#8be7ff]">Two-party manual resolution</p>
+                      <p className="mt-1">{decision.manual_rationale}</p>
+                      <p className="mt-2 text-[#71877c]">Proposed and confirmed by the bound parties onchain.</p>
+                    </div>
+                  )}
 
                   <div className="mt-6 grid grid-cols-3 divide-x divide-white/10 rounded-xl border border-white/10 bg-black/15 py-4 text-center">
                     <Metric value="3 / 5" label="Quorum" />

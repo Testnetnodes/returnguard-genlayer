@@ -12,9 +12,9 @@ Marketplace return disputes are slow, inconsistent, and expensive to review manu
 2. The same merchant opens a case, names one customer wallet, submits only the merchant side, and locks native test GEN in the payable contract.
 3. Only that bound customer wallet can accept the case and submit the customer claim and evidence.
 4. Only either bound party can start adjudication; outsiders are rejected.
-5. Validators independently reproduce the policy judgment and compare the stable settlement fields.
+5. Validators independently reproduce the policy judgment. Equivalence compares only the normalized `decision` enum; rationale wording, policy-test labels, confidence, and key-fact prose are intentionally not compared.
 6. `REFUND_APPROVED` queues the escrow to the customer, while `REFUND_REJECTED` queues it back to the merchant when the decision finalizes.
-7. `MANUAL_REVIEW` keeps escrow locked until one party proposes a settlement recipient and the other party confirms it.
+7. `MANUAL_REVIEW` keeps escrow locked. Either bound party can record a recipient plus rationale with `propose_manual_settlement`; only the other party can finalize that exact proposal with `confirm_manual_settlement`.
 
 Possible outcomes:
 
@@ -22,11 +22,11 @@ Possible outcomes:
 - `REFUND_REJECTED`
 - `MANUAL_REVIEW`
 
-`MANUAL_REVIEW` is a deliberate safety outcome for contradictory evidence, missing facts, or ambiguous policies. Neither side can release its escrow alone.
+`MANUAL_REVIEW` is a deliberate safety outcome for contradictory evidence, missing facts, or ambiguous policies. It is not a terminal dead end: the proposal and rationale are stored onchain, the other party must confirm, and the confirmed resolution is appended to the case decision before escrow is released. Neither side can release escrow alone.
 
 ## Why GenLayer
 
-Traditional contracts can enforce explicit conditions but cannot reliably interpret natural-language policies and conflicting evidence. ReturnGuard uses GenLayer's Equivalence Principle so one AI model does not decide alone. The validator set independently reproduces the judgment and compares only the fields that affect settlement.
+Traditional contracts can enforce explicit conditions but cannot reliably interpret natural-language policies and conflicting evidence. ReturnGuard uses GenLayer's Equivalence Principle so one AI model does not decide alone. The validator set independently reproduces the judgment and binds consensus only to the decision enum. Free-form rationale remains auditable output but is explicitly excluded from equivalence, so validators can agree on the outcome while explaining it differently.
 
 ## Repository structure
 
@@ -71,6 +71,7 @@ pytest tests/direct -v
 6. Switch to the exact customer wallet and call `accept_case` with the customer claim and evidence.
 7. From either bound wallet, call `adjudicate` with the same `case_id`.
 8. Read `get_decision`, `get_case_status`, and `get_escrow_amount`.
+9. For `MANUAL_REVIEW`, call `propose_manual_settlement(case_id, "CUSTOMER" | "MERCHANT", rationale)` from either bound wallet, inspect `get_manual_proposal`, then call `confirm_manual_settlement(case_id)` from the other wallet.
 
 ## Security choices
 
@@ -85,22 +86,19 @@ pytest tests/direct -v
 - Only the two bound parties can call `adjudicate`.
 - Evidence is explicitly treated as untrusted data, not instructions.
 - Output values are constrained to three decision types.
-- Validators independently review the judgment under the contract's Equivalence Principle.
+- Validators independently review the judgment under the contract's Equivalence Principle; only the normalized decision enum is compared, never free-form rationale.
 - Every case is stored independently by `case_id`; later submissions cannot overwrite earlier cases.
 - Once a case has a decision, repeat `adjudicate` calls are rejected.
 - Approved or rejected decisions emit a native GEN transfer to the correct party on finalization.
-- Unclear cases keep funds locked and require both parties for manual settlement.
+- Unclear cases keep funds locked until one bound party records a recipient and rationale and the other party confirms the proposal.
 
 ## Live MVP status
 
-The interface connects a real browser wallet, enforces the merchant/customer handoff, funds native test GEN escrow, starts full AI consensus, reads the decision, and links every transaction to the Studionet explorer.
+The interface connects a real browser wallet, enforces the merchant/customer handoff, funds native test GEN escrow, starts full AI consensus, and provides an onchain propose/confirm workflow for manual settlements. Every transaction is linked to the Studionet explorer.
 
-- Contract: [`0xf7a96A3e207B244fd9BdF8Ee0904285eb30fd501`](https://explorer-studio.genlayer.com/address/0xf7a96A3e207B244fd9BdF8Ee0904285eb30fd501)
-- Deployment transaction: [`0xfdacf11b438a59ac6e2701c11681345722c28017a284765d9bb791a792a915f0`](https://explorer-studio.genlayer.com/tx/0xfdacf11b438a59ac6e2701c11681345722c28017a284765d9bb791a792a915f0)
-- Merchant policy transaction: [`0xb68f50f6c81fd43d0ab5d84ce39d3e6ffac1b2ade62016c8a63f75f247a2327f`](https://explorer-studio.genlayer.com/tx/0xb68f50f6c81fd43d0ab5d84ce39d3e6ffac1b2ade62016c8a63f75f247a2327f)
-- Escrow funding transaction: [`0x3153d10ef1856b286aeefda89349da029be48aace0f11840c97da7b22a8bd5be`](https://explorer-studio.genlayer.com/tx/0x3153d10ef1856b286aeefda89349da029be48aace0f11840c97da7b22a8bd5be)
-- Bound customer acceptance: [`0x7f1bebef87c4caa710f55803deee082a8f58ae3dccc0cc98063cdd9565b4f9c0`](https://explorer-studio.genlayer.com/tx/0x7f1bebef87c4caa710f55803deee082a8f58ae3dccc0cc98063cdd9565b4f9c0)
-- Decision transactions are generated per case and linked from the interface after consensus.
+- Contract: [`0x64E8C5D7A4E8627e83Fe80e10d10681E944f5e58`](https://explorer-studio.genlayer.com/address/0x64E8C5D7A4E8627e83Fe80e10d10681E944f5e58)
+- Deployment transaction: [`0xe64d3875860889ab795ff95d8b9bac237ef06ff39a68025e1ff64b7af6209f5f`](https://explorer-studio.genlayer.com/tx/0xe64d3875860889ab795ff95d8b9bac237ef06ff39a68025e1ff64b7af6209f5f)
+- Policy, escrow, acceptance, AI decision, manual proposal, and manual confirmation transactions are generated per case and linked from the interface.
 
 ## License
 

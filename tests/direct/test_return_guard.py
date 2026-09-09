@@ -180,3 +180,66 @@ def test_multiple_cases_are_kept_independently(direct_vm, direct_deploy, direct_
     assert "RG-2002" in contract.get_case("RG-2002")
     assert contract.get_escrow_amount("RG-2001") == ONE_GEN
     assert contract.get_escrow_amount("RG-2002") == ONE_GEN
+
+
+def test_manual_review_has_a_two_party_settlement_path(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    contract = direct_deploy("contracts/return_guard.py", sdk_version=SDK_VERSION)
+    open_case(contract, direct_vm, direct_alice, direct_bob)
+    accept_case(contract, direct_vm, direct_bob)
+    direct_vm.mock_llm(
+        ".*",
+        json.dumps(
+            {
+                "decision": "MANUAL_REVIEW",
+                "policy_test": "INSUFFICIENT_EVIDENCE",
+                "confidence": 55,
+                "rationale": "The submitted records conflict. Both parties should agree on settlement.",
+                "key_fact": "The condition at delivery cannot be verified.",
+            }
+        ),
+    )
+
+    direct_vm.sender = direct_bob
+    contract.adjudicate("RG-1001")
+    assert contract.get_case_status("RG-1001") == "MANUAL_REVIEW"
+    assert contract.get_escrow_amount("RG-1001") == ONE_GEN
+
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception, match="only the bound merchant or customer"):
+        contract.propose_manual_settlement("RG-1001", "CUSTOMER", "Refund the customer.")
+
+    direct_vm.sender = direct_alice
+    contract.propose_manual_settlement(
+        "RG-1001",
+        "CUSTOMER",
+        "The merchant accepts the delivery evidence gap and offers the refund.",
+    )
+    proposal = json.loads(contract.get_manual_proposal("RG-1001"))
+    assert proposal["recipient"] == "CUSTOMER"
+    assert "delivery evidence gap" in proposal["rationale"]
+
+    with pytest.raises(Exception, match="other party must confirm"):
+        contract.confirm_manual_settlement("RG-1001")
+
+    direct_vm.sender = direct_bob
+    contract.confirm_manual_settlement("RG-1001")
+    decision = json.loads(contract.get_decision("RG-1001"))
+    assert decision["decision"] == "MANUAL_REVIEW"
+    assert decision["settlement"] == "CUSTOMER"
+    assert decision["manual_resolution"] == "CUSTOMER"
+    assert "delivery evidence gap" in decision["manual_rationale"]
+    assert contract.get_case_status("RG-1001") == "SETTLEMENT_QUEUED"
+    assert contract.get_escrow_amount("RG-1001") == 0
+
+
+def test_validator_consensus_compares_only_the_decision_enum():
+    source = open("contracts/return_guard.py", encoding="utf-8").read()
+    validator = source.split("def validator_fn", 1)[1].split("accepted =", 1)[0]
+
+    assert 'proposed["decision"] == validator_result["decision"]' in validator
+    assert 'proposed["policy_test"]' not in validator
+    assert 'proposed["confidence"]' not in validator
+    assert "Rationale, policy_test, confidence, and key_fact" in validator
+    assert "are not compared" in validator
