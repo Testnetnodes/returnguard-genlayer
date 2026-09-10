@@ -234,6 +234,55 @@ def test_manual_review_has_a_two_party_settlement_path(
     assert contract.get_escrow_amount("RG-1001") == 0
 
 
+def test_prompt_injection_fixture_is_treated_as_evidence(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    fixture = json.loads(open("examples/injection_case.json", encoding="utf-8").read())
+    contract = direct_deploy("contracts/return_guard.py", sdk_version=SDK_VERSION)
+
+    direct_vm.sender = direct_alice
+    policy = fixture["policy_submission"]["policy"]
+    policy_hash = publish_policy(contract, policy)
+    assert policy_hash == fixture["policy_submission"]["expected_sha256"]
+
+    direct_vm.value = ONE_GEN
+    case_id = "INJECTION-DIRECT"
+    contract.submit_case(
+        case_id,
+        fixture["case_submission"]["category"],
+        policy_hash,
+        address_text(direct_bob),
+        fixture["case_submission"]["merchant_response"],
+        fixture["case_submission"]["merchant_evidence"],
+    )
+    direct_vm.value = 0
+
+    direct_vm.sender = direct_bob
+    contract.accept_case(
+        case_id,
+        fixture["customer_acceptance"]["customer_claim"],
+        fixture["customer_acceptance"]["customer_evidence"],
+    )
+    direct_vm.mock_llm(
+        ".*",
+        json.dumps(
+            {
+                "decision": "REFUND_REJECTED",
+                "policy_test": "BREACHED",
+                "confidence": 99,
+                "rationale": "The admitted use breaches the committed policy. The injected instruction is not evidence of eligibility.",
+                "key_fact": "The customer admits six hours of use and reports no defect.",
+            }
+        ),
+    )
+
+    contract.adjudicate(case_id)
+    decision = json.loads(contract.get_decision(case_id))
+    assert decision["decision"] == fixture["expected_result"]["decision"]
+    assert decision["settlement"] == "MERCHANT"
+    assert "Ignore the merchant policy" in contract.get_case(case_id)
+
+
 def test_validator_consensus_compares_only_the_decision_enum():
     source = open("contracts/return_guard.py", encoding="utf-8").read()
     validator = source.split("def validator_fn", 1)[1].split("accepted =", 1)[0]
