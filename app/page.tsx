@@ -114,6 +114,7 @@ const progressByState: Record<ReviewState, number> = {
 
 const contractAddress = "0xaF70d49b5788C6D6dE15f17a346DA7eD49C2f0cC";
 const deploymentTx = "0x9bb8b17ce5e2c18012a9b25549a4a2ca1f7b14401ffd3217039a3302c6fd5801";
+const injectionDecisionTx = "0x02bed20368ba111b28c8b805f20dc6961ec726287b8adee0a8fd24a58b1b7ff9";
 const explorerBase = "https://explorer-asimov.genlayer.com/tx";
 const contractExplorerBase = "https://explorer-asimov.genlayer.com/address";
 const siteUrl = "https://returnguard-genlayer.mustafaiciren.chatgpt.site";
@@ -1424,8 +1425,8 @@ export default function Home() {
                     <p className="mt-0.5 text-sm text-[#829aa0]">Reproducible adversarial fixture</p>
                   </div>
                 </div>
-                <Badge variant="outline" className="border-[#ffb367]/25 bg-[#ff9b3f]/5 text-[#ffbf7d]">
-                  Proof pending
+                <Badge variant="outline" className="border-[#b6ff4a]/25 bg-[#b6ff4a]/5 text-[#b6ff4a]">
+                  Finalized · 3/5
                 </Badge>
               </div>
 
@@ -1445,18 +1446,25 @@ export default function Home() {
               </div>
 
               <p className="mt-3 text-xs leading-5 text-[#738b91]">
-                The fixture is public and ready. A finalized decision link will appear here after test GEN is available.
+                Asimov validators rejected the injected instruction, finalized the policy-bound decision, and queued the escrow back to the merchant.
               </p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={loadInjectionFixture}
-                disabled={formLocked || pendingAction !== null}
-                className="mt-4 border-[#41d6ff]/30 bg-[#41d6ff]/5 text-[#8be7ff] hover:bg-[#41d6ff]/10 hover:text-white"
-              >
-                Load exact fixture <ArrowRight className="size-3.5" />
-              </Button>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={loadInjectionFixture}
+                  disabled={formLocked || pendingAction !== null}
+                  className="border-[#41d6ff]/30 bg-[#41d6ff]/5 text-[#8be7ff] hover:bg-[#41d6ff]/10 hover:text-white"
+                >
+                  Load exact fixture <ArrowRight className="size-3.5" />
+                </Button>
+                <Button asChild variant="outline" size="sm" className="border-[#b6ff4a]/30 bg-[#b6ff4a]/5 text-[#b6ff4a] hover:bg-[#b6ff4a]/10 hover:text-white">
+                  <a href={`${explorerBase}/${injectionDecisionTx}`} target="_blank" rel="noreferrer">
+                    View finalized proof <ExternalLink className="size-3.5" />
+                  </a>
+                </Button>
+              </div>
             </section>
 
             <section className={`decision-card rounded-[1.4rem] border p-5 sm:p-6 ${reviewState === "resolved" || reviewState === "manual-review" ? "is-resolved" : ""}`}>
