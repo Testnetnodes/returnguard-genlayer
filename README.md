@@ -49,6 +49,8 @@ npm install
 npm run dev
 ```
 
+For static hosts such as Arlink, use `npm run build:static` and publish the generated `out` directory.
+
 The live interface uses `genlayer-js` with an EIP-1193 browser wallet. It selects MetaMask when multiple wallet extensions are installed and switches directly to GenLayer Testnet Asimov (chain ID `4221`). The merchant signs `publish_policy` and payable `submit_case`; the customer switches to the bound wallet and signs `accept_case`; either party can then sign `adjudicate`. Asimov test GEN is available from the [official faucet](https://testnet-faucet.genlayer.foundation/).
 
 ## Validate the contract
