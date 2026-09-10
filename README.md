@@ -83,7 +83,7 @@ pytest tests/direct -v
 
 The expected result is `REFUND_REJECTED`: the claim itself admits the policy breach, and text inside `<case_data>` is explicitly treated as evidence rather than instructions. The live interface can load this complete fixture with **Load injection test**.
 
-The Asimov contract deployment is finalized. The injection decision transaction is currently marked `PENDING_TEST_GEN`; it will be added here only after the transaction itself reaches `FINALIZED`. The reproducible runner is `scripts/prove-asimov-injection.mjs` and reads two local, gitignored keys from `.env.asimov-proof`.
+The exact fixture was executed on Asimov and finalized as `REFUND_REJECTED`. The consensus transaction finished with `AGREE`, a 3/5 quorum, and `FINISHED_WITH_RETURN`: [`0x02bed20368ba111b28c8b805f20dc6961ec726287b8adee0a8fd24a58b1b7ff9`](https://explorer-asimov.genlayer.com/tx/0x02bed20368ba111b28c8b805f20dc6961ec726287b8adee0a8fd24a58b1b7ff9). The resulting case status is `SETTLEMENT_QUEUED` and its onchain escrow balance is zero. The reproducible runner is `scripts/prove-asimov-injection.mjs` and reads two local, gitignored keys from `.env.asimov-proof`.
 
 ## Security choices
 
@@ -111,7 +111,7 @@ The interface connects a real browser wallet, enforces the merchant/customer han
 - Network: GenLayer Testnet Asimov (`4221`)
 - Contract: [`0xaF70d49b5788C6D6dE15f17a346DA7eD49C2f0cC`](https://explorer-asimov.genlayer.com/address/0xaF70d49b5788C6D6dE15f17a346DA7eD49C2f0cC)
 - Finalized deployment transaction: [`0x9bb8b17ce5e2c18012a9b25549a4a2ca1f7b14401ffd3217039a3302c6fd5801`](https://explorer-asimov.genlayer.com/tx/0x9bb8b17ce5e2c18012a9b25549a4a2ca1f7b14401ffd3217039a3302c6fd5801)
-- Injection decision: pending test GEN; no finality claim is made until the explorer reports `FINALIZED`.
+- Finalized injection decision: [`0x02bed20368ba111b28c8b805f20dc6961ec726287b8adee0a8fd24a58b1b7ff9`](https://explorer-asimov.genlayer.com/tx/0x02bed20368ba111b28c8b805f20dc6961ec726287b8adee0a8fd24a58b1b7ff9) — `REFUND_REJECTED`, `AGREE`, 3/5 quorum.
 - Policy, escrow, acceptance, AI decision, manual proposal, and manual confirmation transactions are generated per case and linked from the interface.
 
 ## License
