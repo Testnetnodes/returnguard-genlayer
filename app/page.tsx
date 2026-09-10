@@ -194,7 +194,7 @@ async function getEthereumProvider() {
   );
 }
 
-function walletErrorCode(error: unknown) {
+function walletErrorCode(error: unknown): number | undefined {
   if (typeof error === "object" && error && "code" in error) {
     return Number((error as { code: unknown }).code);
   }
